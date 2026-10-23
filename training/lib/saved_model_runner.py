@@ -221,7 +221,13 @@ def run(model_dir, data_path, target_unit, *, flavor, sensor_file='sensor_roles.
         warmup_hours=None, output_dir='saved_model_checks', threads=2):
     folder = Path(model_dir).resolve()
     cfg = json.loads((folder / 'config.json').read_text(encoding='utf-8'))
-    detected = 'legacy' if 'core' in cfg else 'actual' if 'method' in cfg else None
+    detected = 'incremental' if cfg.get('core') == 'incremental' else 'legacy' if 'core' in cfg else 'actual' if 'method' in cfg else None
+    if detected == 'incremental':
+        from monitoring_v3.saved import run_saved
+        return run_saved(model_dir, data_path, target_unit, sensor_file=sensor_file,
+            period_start=period_start, period_end=period_end, allow_before_cutoff=allow_before_cutoff,
+            require_unseen_unit=require_unseen_unit, warmup_hours=warmup_hours, output_dir=output_dir,
+            allow_missing_targets=allow_missing_targets, threads=threads)
     if flavor != detected:
         raise ValueError(f'Формат модели {detected}, открыт ноутбук {flavor}.')
     output_root = Path(output_dir).resolve()

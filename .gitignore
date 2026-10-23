@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+training/runs/
+training/saved_model_checks/
+catboost_info/
+node_modules/
+dashboard/predictive_maintenance_dashboard/dist/
+tests/

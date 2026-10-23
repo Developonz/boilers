@@ -1,0 +1,12 @@
+{
+  "groups": {"БКЗ-500": ["К-5", "К-6", "К-7"]},
+  "data_root": "opc_wide",
+  "data_paths": {},
+  "sensor_file": "sensor_roles.xlsx",
+  "sensor_rules": "sensor_rules.json",
+  "output": "runs/incremental",
+  "first_test": "2025-03-01",
+  "models": ["analogs", "AAKR", "MSET", "HistGradientBoosting", "CatBoost"],
+  "feature_sets": ["conditions", "forecast"],
+  "scenarios": ["local", "pooled", "transfer"]
+}

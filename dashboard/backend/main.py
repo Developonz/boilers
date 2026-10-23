@@ -817,7 +817,7 @@ def build_kpis(ev: Evaluation, prefix: str, parameters: Dict[str, Any]) -> List[
 def technical_state(ev: Evaluation) -> Dict[str, Any]:
     """Режим и техсостояние агрегата на момент at — только из модели."""
     mode_label = MODE_LABELS.get(ev.mode_now, ev.mode_now)
-    operating_mode = "stopped" if ev.mode_now == M_STOP else "running"
+    operating_mode = "stopped" if ev.mode_now == M_STOP else "unknown" if ev.mode_now == 'неизвестно' else "running"
     ratio = ev.ratio_now
     persist = ev.lm.cfg.get("persist_steps", 3)
     if ev.not_scored_reason:
@@ -843,6 +843,7 @@ def technical_state(ev: Evaluation) -> Dict[str, Any]:
         "healthTrend": trend,
         "modelRatio": fnum(ratio, 3),
         "modelAlarm": ev.alarm_now,
+        "interpretation": ev.interpretation,
         "statusCritical": status == "critical",
     }
 

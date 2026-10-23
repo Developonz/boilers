@@ -88,6 +88,8 @@ def execute(notebook, output, config=None, check_only=False):
             os.environ.pop('MPLBACKEND', None)
         else:
             os.environ['MPLBACKEND'] = previous_backend
+    if check_only and namespace.get('ISSUES'):
+        raise ValueError('Проверка источников обнаружила проблемы: '+str(namespace['ISSUES']))
     print('Проверка входов завершена.' if check_only else 'Все ячейки выполнены.', flush=True)
     return nb
 

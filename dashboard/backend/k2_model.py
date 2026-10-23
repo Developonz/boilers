@@ -204,7 +204,8 @@ def _load_model(root: Path, view_name: str, model_unit: str = '') -> LoadedModel
     cfg = json.loads((folder / 'config.json').read_text(encoding='utf-8'))
     if str(cfg.get('version', '')).startswith('02-v4'):
         return load_v4_model(folder, model, cfg, view_name, model_unit)
-    install_acceleration(model, module)
+    if cfg.get('core') != 'incremental':
+        install_acceleration(model, module)
     views = cfg.get('views') or []
     if not views:
         raise DataUnavailable(f'В {folder / "config.json"} нет видов (views)')
@@ -274,7 +275,8 @@ class LegacyAdapter:
                 self._input_capture.reset(token)
         # Report invalid sensor inputs as unscored, not as zero deviation.
         # _inputs is the export's own preparation, including its causal filters.
-        if self.core.cfg.get('causal_cleaning') and self.core.cfg.get('input') != 'residuals':
+        if (self.core.cfg.get('causal_cleaning') and self.core.cfg.get('input') != 'residuals'
+                and self.core.cfg.get('core') != 'incremental'):
             if captured:
                 index, missing = captured['index'], captured['missing']
             else:
@@ -423,6 +425,7 @@ class Evaluation:
     health_now: Optional[int]
     not_scored_reason: str = ''            # почему час at не оценён моделью
     alarm_sensors: List[Tuple[str, float]] = field(default_factory=list)
+    interpretation: Dict[str, Any] = field(default_factory=dict)
 
 
 # ============================================================================ сервис
@@ -585,6 +588,9 @@ class K2Service:
     def _mode(self, df: pd.DataFrame) -> pd.Series:
         lm = self.model()
         cfg = lm.cfg
+        if cfg.get('core') == 'incremental':
+            core = lm.model.core if isinstance(lm.model, LegacyAdapter) else lm.model
+            return core.operating_mode(df)
         return lm.module.detect_mode(df[cfg['run_col']].astype(float), cfg['run_thr'], cfg['startup_steps'],
                                      cfg['prestop_steps'], cfg['min_stop_steps'], cfg['ffill_steps'])
 
@@ -789,7 +795,9 @@ class K2Service:
                           alarm=alarm, health=health, errors=errors, errors_smooth=errors_smooth, expected=exp,
                           episodes=episodes, sensors=sensors, frozen_hours=frozen_now, missing=list(r.missing),
                           mode_now=mode_now, ratio_now=ratio_now, alarm_now=alarm_now, health_now=health_now,
-                          not_scored_reason=not_scored, alarm_sensors=alarm_sensors)
+                          not_scored_reason=not_scored, alarm_sensors=alarm_sensors,
+                          interpretation=(r.interpretation.loc[at].where(pd.notna(r.interpretation.loc[at]), None).to_dict()
+                                          if hasattr(r,'interpretation') and at in r.interpretation.index else {}))
 
     # ---------------------------------------------------------------- описание модели для API
     def model_info(self, lm=None) -> Dict[str, Any]:

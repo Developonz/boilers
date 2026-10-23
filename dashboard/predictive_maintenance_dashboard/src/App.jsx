@@ -14,6 +14,14 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import './styles.css';
 import { getAccessToken } from './lib/auth';
 
+const INTERPRETATION_LABELS = {
+  mode_change: 'Смена режима',
+  transition: 'Переходный процесс',
+  measurement_fault: 'Возможная проблема измерения',
+  process_change: 'Изменение состояния узла',
+  pre_failure: 'Признаки предаварийного состояния',
+};
+
 // ============================================================================
 // Конфигурация
 // ============================================================================
@@ -2061,6 +2069,27 @@ export default function App() {
             </p>
           </div>
         </div>
+      )}
+
+      {activeTab !== 'fleet' && summary?.modelRatio > 1 && summary?.interpretation && (
+        <section className="alert-banner" aria-label="Интерпретация отклонения">
+          <div>
+            <strong>
+              {summary.interpretation.label && summary.interpretation.label !== 'unknown'
+                ? (INTERPRETATION_LABELS[summary.interpretation.label] || summary.interpretation.label)
+                : 'Смысл отклонения пока не определён'}
+            </strong>
+            {summary.interpretation.label !== 'unknown' && Number.isFinite(summary.interpretation.confidence) && (
+              <p>Уверенность оценки: {Math.round(summary.interpretation.confidence * 100)}%.</p>
+            )}
+            {[24, 168].map((hours) => Number.isFinite(summary.interpretation[`risk_${hours}h`]) && (
+              <p key={hours}>
+                Оценка риска аварийного останова в течение {hours === 24 ? 'суток' : 'недели'}:{' '}
+                {Math.round(summary.interpretation[`risk_${hours}h`] * 100)}%.
+              </p>
+            ))}
+          </div>
+        </section>
       )}
 
       {error && (
