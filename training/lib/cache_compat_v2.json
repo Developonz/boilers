@@ -1,0 +1,11 @@
+{
+  "version": "legacy-roles-groups-2.0",
+  "core_hash": "176e08a45974a1e3a58199d5b947ab89ffb898315276bab31f0df7d65348a3a0",
+  "fleet_hash": "f0725039c7a1e44b95847982d9b98b12466a679a6b4512f95b7ad639af274935",
+  "fleet_version": "legacy-fleet-2.0",
+  "sources": {
+    "legacy_group.py": "605b66b2ad2fefdc0b2aa18b4d4eed733daabc60818a5a30f34930db60093619",
+    "k2_lib.py": "e517fad9bd2a895f89f01b41cd5e09e61876b76bfba3d3f97daf665aad3df0bc",
+    "kernel_models.py": "f551fe1d1bd84b3445d7a014851c1bc7930d4575595d2d745f170305afcd834d"
+  }
+}

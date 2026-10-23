@@ -1,0 +1,89 @@
+{
+  "defaults": {
+    "view": "AAKR: медленный сдвиг (2 сут)",
+    "history_days": null,
+    "window_hours": 24
+  },
+  "boilers": [
+    {
+      "tpp_id": "ni-tec-1",
+      "tpp_name": "НИ-ТЭЦ 1",
+      "ka_id": "ka-1",
+      "name": "КА-1",
+      "data_path": "data/К-1/hourly.parquet",
+      "model_dir": "../legacy/models_legacy/Группа 1/local_common__К-1__v22__fast/К-1/aakr/final",
+      "history_dir": "../legacy/models_legacy/Группа 1/local_common__К-1__v22__fast/К-1/aakr",
+      "model_unit": "К-1"
+    },
+    {
+      "tpp_id": "ni-tec-1",
+      "tpp_name": "НИ-ТЭЦ 1",
+      "ka_id": "ka-2",
+      "name": "КА-2",
+      "data_path": "data/К-2/hourly.parquet",
+      "model_dir": "../legacy/models_legacy/Группа 1/local_common__К-2__v22__fast/К-2/aakr/final",
+      "history_dir": "../legacy/models_legacy/Группа 1/local_common__К-2__v22__fast/К-2/aakr",
+      "model_unit": "К-2"
+    },
+    {
+      "tpp_id": "ni-tec-1",
+      "tpp_name": "НИ-ТЭЦ 1",
+      "ka_id": "ka-3",
+      "name": "КА-3",
+      "data_path": "data/К-3/hourly.parquet",
+      "model_dir": "../legacy/models_legacy/Группа 1/local_common__К-3__v22__fast/К-3/aakr/final",
+      "history_dir": "../legacy/models_legacy/Группа 1/local_common__К-3__v22__fast/К-3/aakr",
+      "model_unit": "К-3"
+    },
+    {
+      "tpp_id": "ni-tec-1",
+      "tpp_name": "НИ-ТЭЦ 1",
+      "ka_id": "ka-4",
+      "name": "КА-4",
+      "data_path": "data/К-4/hourly.parquet",
+      "model_dir": "../legacy/models_legacy/Группа 1/local_common__К-4__v22__fast/К-4/aakr/final",
+      "history_dir": "../legacy/models_legacy/Группа 1/local_common__К-4__v22__fast/К-4/aakr",
+      "model_unit": "К-4"
+    },
+    {
+      "tpp_id": "ni-tec-1",
+      "tpp_name": "НИ-ТЭЦ 1",
+      "ka_id": "ka-5",
+      "name": "КА-5",
+      "data_path": "data/К-5/hourly.parquet",
+      "model_dir": "../legacy/models_legacy/Группа 2/local_common__К-5__v22__fast/К-5/aakr/final",
+      "history_dir": "../legacy/models_legacy/Группа 2/local_common__К-5__v22__fast/К-5/aakr",
+      "model_unit": "К-5"
+    },
+    {
+      "tpp_id": "ni-tec-1",
+      "tpp_name": "НИ-ТЭЦ 1",
+      "ka_id": "ka-6",
+      "name": "КА-6",
+      "data_path": "data/К-6/hourly.parquet",
+      "model_dir": "../legacy/models_legacy/Группа 2/local_common__К-6__v22__fast/К-6/aakr/final",
+      "history_dir": "../legacy/models_legacy/Группа 2/local_common__К-6__v22__fast/К-6/aakr",
+      "model_unit": "К-6"
+    },
+    {
+      "tpp_id": "ni-tec-1",
+      "tpp_name": "НИ-ТЭЦ 1",
+      "ka_id": "ka-7",
+      "name": "КА-7",
+      "data_path": "data/К-7/hourly.parquet",
+      "model_dir": "../legacy/models_legacy/Группа 2/local_common__К-7__v22__fast/К-7/aakr/final",
+      "history_dir": "../legacy/models_legacy/Группа 2/local_common__К-7__v22__fast/К-7/aakr",
+      "model_unit": "К-7"
+    },
+    {
+      "tpp_id": "ni-tec-1",
+      "tpp_name": "НИ-ТЭЦ 1",
+      "ka_id": "ka-8",
+      "name": "КА-8",
+      "data_path": "data/К-8/hourly.parquet",
+      "model_dir": "../legacy/models_legacy/Группа 3/local_full__К-8__v22__fast/К-8/aakr/final",
+      "history_dir": "../legacy/models_legacy/Группа 3/local_full__К-8__v22__fast/К-8/aakr",
+      "model_unit": "К-8"
+    }
+  ]
+}
