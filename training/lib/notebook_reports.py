@@ -4,6 +4,9 @@ from html import escape
 from io import BytesIO
 from pathlib import Path
 import json
+import math
+import os
+from numbers import Real
 import pandas as pd
 
 
@@ -40,15 +43,53 @@ def configure(cfg, rule_overrides=None):
     return cfg
 
 
+def notebook_config(settings=None, rule_overrides=None):
+    """Reload the base file and apply notebook overrides before each preparation."""
+    from monitoring_v3.config import load
+    cfg = load(os.environ.get('BOILER_CONFIG_JSON', 'incremental_settings.json'))
+    cfg.update(settings or {})
+    thresholds = cfg.get('run_thresholds', {})
+    if not isinstance(thresholds, dict):
+        raise ValueError('run_thresholds должен быть словарём: {"К-5": 140.0}')
+    for unit, value in thresholds.items():
+        if value is not None and (isinstance(value, bool) or not isinstance(value, Real)
+                                  or not math.isfinite(float(value))):
+            raise ValueError(f'run_thresholds[{unit!r}]: укажите конечное число, например 140.0')
+    return configure(cfg, rule_overrides)
+
+
+def check_preparation_thresholds(contexts, cfg):
+    """Never present an old context as if it used the currently selected threshold."""
+    from monitoring_v3.preparation import run_threshold
+    for unit, c in contexts.items():
+        selected = cfg['run_thresholds'].get(unit)
+        expected = (float(selected) if selected is not None else
+                    run_threshold(c['frame'][c['load']], c['frame'].get('Состояние'),
+                                  cfg['first_test'], cfg['threshold_fraction']))
+        if not math.isclose(float(c['threshold']), expected, rel_tol=1e-10, abs_tol=1e-10):
+            raise ValueError(f'{unit}: текущий порог работы {expected:g}, но данные подготовлены '
+                             f'с порогом {c["threshold"]:g}. Повторите ячейку «Данные, режимы '
+                             'и события до обучения».')
+
+
 def show_preparation(contexts, issues, cfg):
     from IPython.display import display, Image
     from monitoring_v3.data import healthy
+    from incremental_plots import plot_preparation
+    import matplotlib.pyplot as plt
+    check_preparation_thresholds(contexts, cfg)
     show_table('Проблемы источников',pd.DataFrame(issues,columns=['unit','problem','path']).rename(
         columns={'unit':'котёл','problem':'проблема','path':'путь'}),bool(issues))
+    active={unit for units in cfg['groups'].values() for unit in units}
+    unused=[{'котёл в run_thresholds':unit,'порог':value,'причина':'котла нет в groups'}
+            for unit,value in cfg['run_thresholds'].items() if unit not in active]
+    if unused:
+        show_table('Неиспользуемые пороги: проверьте имена котлов',pd.DataFrame(unused),True)
     step_h = float(pd.Timedelta(cfg['step'])/pd.Timedelta('1h'))
     summary, modes, events = [], [], []
     for unit,c in contexts.items():
         summary.append({'котёл':unit,'датчик нагрузки':c['load'],'единица':c['declared_units'].get(c['load'],''),
+            'задан в run_thresholds':cfg['run_thresholds'].get(unit) if cfg['run_thresholds'].get(unit) is not None else 'авто',
             'порог работы':c['threshold'],'источник порога':c['threshold_source'],
             'начало истории':c['frame'].index[0],'конец истории':c['frame'].index[-1],
             'ошибочных дат':c['invalid_timestamps'],'дублей времени':c['duplicate_timestamps'],
@@ -74,9 +115,13 @@ def show_preparation(contexts, issues, cfg):
         for flag in ('spike','frozen','masked'):
             stats[flag+', ч']=c['quality'].xs(flag,axis=1,level=1).sum().reindex(numeric.columns).to_numpy()*step_h
         show_table(unit+' · доступность и качество измерений',stats)
-        path=Path(cfg['output'])/'audit'/unit/'load_and_modes.png'
-        if path.exists():
-            display(Image(filename=str(path)))
+        figure=plot_preparation(c)
+        buffer=BytesIO()
+        try:
+            figure.savefig(buffer,format='png',dpi=130)
+            display(Image(data=buffer.getvalue()))
+        finally:
+            plt.close(figure)
     return event_table
 
 
@@ -94,6 +139,9 @@ def experiment_directories(cfg):
 
 def show_results(cfg, result):
     show_table('Состояние расчёта',result['status'],True)
+    exports=Path(cfg['output'])/'models.csv'
+    if exports.exists():
+        show_table('Готовые модели для дашборда: model_dir → MODEL_DIR',read_report(exports),True)
     show_table('Качество моделей и схем тревог',result['summary'],True)
     common=Path(cfg['output'])/'comparison_common_hours.csv'
     if common.exists() and common.stat().st_size>1:

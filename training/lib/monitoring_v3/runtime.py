@@ -15,7 +15,7 @@ from .preparation import regimes
 from .alarm_scores import alarm_stream
 
 
-def export(state, context, spec, cfg, folder):
+def export(state, context, spec, cfg, folder, fingerprint=None):
     folder = Path(folder); folder.mkdir(parents=True, exist_ok=True)
     package = dict(state=state, spec=spec, config=cfg, roles=context['roles'], unit=context['unit'],
                    threshold=context['threshold'], rules=json.loads(Path(cfg['sensor_rules']).read_text(encoding='utf-8')),
@@ -68,6 +68,8 @@ def load(folder=None):
                     group=spec['group'], cond_spec=dict(mills={}),
                     training_update='incremental', calibration_strategy='current_version_heldout',
                     label_status='causes require reviewed episodes')
+    if fingerprint is not None:
+        metadata['checkpoint_fingerprint']=fingerprint
     (folder/'config.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2, allow_nan=True), encoding='utf-8')
     rows = []
     for c,r in context['roles'].items():

@@ -31,7 +31,15 @@ def score_views(errors, scale, cfg, groups=None):
         coverage = a.notna().mean(axis=1)
         good = coverage.ge(cfg['minimum_coverage'])
         out = dict(max=a.max(axis=1), mean=a.mean(axis=1), fraction=a.gt(1).where(a.notna()).mean(axis=1))
-        out['top5'] = a.apply(lambda r: r.nlargest(min(5, r.count())).mean(), axis=1)
+        # Select the same descending top five without constructing a Series for
+        # every timestamp. Missing channels stay out of the denominator.
+        values=a.to_numpy(dtype=float,na_value=np.nan)
+        count=np.minimum(5,a.notna().sum(axis=1).to_numpy())
+        k=min(5,len(a.columns))
+        top=np.sort(np.partition(np.where(np.isnan(values),-np.inf,values),
+                                 len(a.columns)-k,axis=1)[:,-k:],axis=1)[:,::-1] if k else values
+        total=np.where(top == -np.inf,0.,top).sum(axis=1)
+        out['top5']=pd.Series(np.divide(total,count,out=np.full(len(a),np.nan),where=count>0),index=a.index)
         for group in sorted(set(groups.values()) - {''}):
             cols = [c for c in a if groups.get(c) == group]
             out['group:'+group] = a[cols].mean(axis=1).where(a[cols].notna().mean(axis=1).ge(cfg['minimum_coverage']))
@@ -46,41 +54,41 @@ def score_views(errors, scale, cfg, groups=None):
     return outputs, matrices
 
 
+def _alarm_runs(values, times, contiguous, required, step_ns, merge_ns):
+    """Array-only episode boundaries, shared by reporting and threshold search."""
+    above=np.isfinite(values)&(values>1)
+    starts=np.flatnonzero(above&(~np.r_[False,above[:-1]]|~contiguous))
+    ends=np.flatnonzero(above&(~np.r_[above[1:],False]|~np.r_[contiguous[1:],False]))+1
+    enough=ends-starts>=required
+    starts,ends=starts[enough],ends[enough]
+    confirmed=starts+required-1
+    notify=np.ones(len(starts),dtype=bool)
+    if len(starts)>1:
+        notify[1:]=(times[confirmed[1:]]-(times[ends[:-1]-1]+step_ns))>=merge_ns
+    return starts,ends,confirmed,notify
+
+
 def alarm_stream(ratio, cfg):
     """No retrospective activation or bridging. merge_hours suppresses repeat notices only."""
-    ix = ratio.index
-    step = pd.Timedelta(cfg['step'])
-    count, first, last_time, last_end = 0, None, None, None
-    confirmed = False
-    active, notices, rows = [], [], []
-    current = None
-    for t, v in ratio.items():
-        contiguous = last_time is not None and t-last_time == step
-        above = np.isfinite(v) and v > 1
-        if not contiguous or not above:
-            if current is not None:
-                current['end'] = last_time+step
-                rows.append(current)
-                last_end = current['end']
-                current = None
-            count, first, confirmed = 0, None, False
-        notice = False
-        if above:
-            first = first if count else t
-            count += 1
-            if not confirmed and count*step >= pd.Timedelta(hours=cfg['persist_hours']):
-                confirmed = True
-                notice = last_end is None or t-last_end >= pd.Timedelta(hours=cfg['merge_hours'])
-                current = dict(start=first, confirmed=t, end=t+step, notification=notice, peak=float(v))
-            if current is not None:
-                current['peak'] = max(current['peak'], float(v))
-        active.append(confirmed and above)
-        notices.append(notice)
-        last_time = t
-    if current is not None:
-        current['end'] = ix[-1]+step
-        rows.append(current)
-    return pd.DataFrame(dict(ratio=ratio, active=active, notification=notices), index=ix), pd.DataFrame(
+    ix=ratio.index;step=pd.Timedelta(cfg['step']);n=len(ix)
+    if not n:
+        return pd.DataFrame(dict(ratio=ratio,active=[],notification=[]),index=ix),pd.DataFrame(
+            columns=['start','confirmed','end','notification','peak'])
+    values=ratio.to_numpy(dtype=float,na_value=np.nan)
+    times=ix.as_unit('ns').asi8
+    contiguous=np.r_[False,np.diff(times)==step.value]
+    required=max(1,int(math.ceil(pd.Timedelta(hours=cfg['persist_hours'])/step)))
+    starts,ends,confirmed,notify=_alarm_runs(values,times,contiguous,required,step.value,
+                                          pd.Timedelta(hours=cfg['merge_hours']).value)
+    changes=np.zeros(n+1,dtype=int)
+    changes[confirmed]+=1;changes[ends]-=1
+    active=np.cumsum(changes[:-1])>0
+    notices=np.zeros(n,dtype=bool)
+    notices[confirmed]=notify
+    # Peaks start at confirmation, matching the original streaming algorithm.
+    rows=[dict(start=ix[a],confirmed=ix[c],end=ix[b-1]+step,notification=bool(flag),
+               peak=float(values[c:b].max())) for a,c,b,flag in zip(starts,confirmed,ends,notify)]
+    return pd.DataFrame(dict(ratio=ratio,active=active,notification=notices),index=ix),pd.DataFrame(
         rows, columns=['start', 'confirmed', 'end', 'notification', 'peak'])
 
 
@@ -94,10 +102,15 @@ def calibrate_threshold(score, cfg, budget=None):
     values = score[valid]
     candidates = np.unique(np.r_[np.maximum(values.quantile(np.linspace(0, 1, 101)), 1e-9),
                                   max(float(values.max())+1e-9, 1e-9)])
+    raw=score.to_numpy(dtype=float,na_value=np.nan)
+    step=pd.Timedelta(cfg['step']);times=score.index.as_unit('ns').asi8
+    contiguous=np.r_[False,np.diff(times)==step.value]
+    required=max(1,int(math.ceil(pd.Timedelta(hours=cfg['persist_hours'])/step)))
+    merge_ns=pd.Timedelta(hours=cfg['merge_hours']).value
     for threshold in candidates:
-        stream, _ = alarm_stream(score/threshold, cfg)
-        rate = stream.notification.sum()*720/hours
-        fraction = float(stream.active[valid].mean())
+        _,ends,confirmed,notices=_alarm_runs(raw/threshold,times,contiguous,required,step.value,merge_ns)
+        rate = np.count_nonzero(notices)*720/hours
+        fraction = float(np.sum(ends-confirmed)/valid.sum())
         if rate <= budget and fraction <= cfg['max_background_fraction']:
             return dict(threshold=float(threshold), hours=float(hours), status='calibrated',
                         alarm_rate=float(rate), alarm_fraction=fraction, budget=float(budget))

@@ -1,9 +1,11 @@
 """Resumable chronological experiments with honest current-version calibration."""
 from copy import deepcopy
+from contextlib import nullcontext
 from pathlib import Path
 import hashlib
 import json
 import os
+import sys
 import importlib.metadata
 import joblib
 import numpy as np
@@ -12,6 +14,9 @@ from .config import load
 from .data import load_sources, healthy, read_rules
 from .models import NormalModel, RelatedModel, AnalogCorrection, MultiTargetModel, balanced_rows
 from .alarm_scores import sensor_scale, score_views, calibrate_threshold, alarm_stream, evaluate
+from .progress import Progress
+from .artifacts import export_ready, publish_export, record_export
+from .threads import numerical_threads
 
 
 def atomic_dump(value, path):
@@ -26,15 +31,16 @@ def dataset(context, variant, horizon, cfg):
     y = context['cleaned'][context['targets']].copy()
     eligible = context['eligible'].copy()
     if variant == 'related':
-        for c in context['targets']:
-            f['sensor::'+c] = y[c]
+        f=pd.concat([f,y.add_prefix('sensor::')],axis=1)
     elif variant == 'forecast':
         shift = max(1, int(round(pd.Timedelta(hours=horizon)/pd.Timedelta(cfg['step']))))
         f = f.shift(shift)
+        lagged={}
         for c in context['targets']:
-            f[c+'::past_value'] = y[c].shift(shift)
-            f[c+'::past_delta'] = y[c].diff().shift(shift)
-            f[c+'::past_held_hours'] = context['changes'][c+'::held_hours'].shift(shift)
+            lagged[c+'::past_value'] = y[c].shift(shift)
+            lagged[c+'::past_delta'] = y[c].diff().shift(shift)
+            lagged[c+'::past_held_hours'] = context['changes'][c+'::held_hours'].shift(shift)
+        f=pd.concat([f,pd.DataFrame(lagged,index=f.index)],axis=1)
         # A forecast must originate in an observed operating interval.
         eligible &= context['eligible'].shift(shift, fill_value=False)
         eligible &= context['eligible'].rolling(shift+1, min_periods=shift+1).sum().eq(shift+1)
@@ -52,7 +58,8 @@ def align_contexts(contexts, units):
             raise ValueError(f'Incompatible physical schema: {col}, roles={roles}, units={declared}')
     out = {}
     for u in units:
-        c = deepcopy(contexts[u])
+        # Frames are read-only here; copy only dictionaries/lists we change.
+        c = dict(contexts[u])
         c['roles'] = {k:v for k,v in c['roles'].items() if k in common}
         c['targets'] = [k for k in c['targets'] if k in common]
         if not c['targets']:
@@ -106,7 +113,9 @@ def _pooled(tables):
     return f
 
 
-def update_at(contexts, spec, cutoff, cfg, previous=None):
+def update_at(contexts, spec, cutoff, cfg, previous=None, progress=None):
+    tag=f'{spec["method"]} · {"+".join(spec["sources"])} · {pd.Timestamp(cutoff):%Y-%m}'
+    phase=lambda text:progress.stage(tag+' · '+text) if progress else nullcontext()
     fparts, yparts = {}, {}
     for u in spec['sources']:
         c = contexts[u]
@@ -128,8 +137,9 @@ def update_at(contexts, spec, cutoff, cfg, previous=None):
         model = (RelatedModel(cfg, cfg['related_inputs']) if spec['variant'] == 'related' else
                  AnalogCorrection(cfg) if spec['method'] == 'CatBoostCorrection' else
                  MultiTargetModel(spec['method'],cfg) if spec['method'] == 'CatBoostMulti' else NormalModel(spec['method'], cfg))
-        model.fit_initial(f.loc[train], y.loc[train])
-        reference = deepcopy(model)
+        with phase(f'первоначальное обучение: {int(train.sum())} строк, {len(y.columns)} целей'):
+            model.fit_initial(f.loc[train], y.loc[train])
+            reference = deepcopy(model)
         ingested = set(f.index[train].tolist())
         audit = dict(status='initial', accepted=True, new_rows=int(train.sum()))
     else:
@@ -149,7 +159,8 @@ def update_at(contexts, spec, cutoff, cfg, previous=None):
             old = reference.memory_f.iloc[balanced_rows(reference.memory_f, min(100, cfg['replay_rows']))]
             old_y = reference.memory_y.reindex(old.index)
             vf, vy = pd.concat([f.loc[val], old]).sort_index(), pd.concat([y.loc[val], old_y]).sort_index()
-            model, audit = model.candidate(nf, ny, vf, vy)
+            with phase(f'обновление и проверка кандидата: {len(nf)} новых строк'):
+                model, audit = model.candidate(nf, ny, vf, vy)
             audit.update(status='updated' if audit['accepted'] else 'candidate_rejected', new_rows=len(nf))
             if audit['accepted']:
                 ingested.update(nf.index.tolist())
@@ -159,18 +170,21 @@ def update_at(contexts, spec, cutoff, cfg, previous=None):
         mask = (cf.index >= cal_start) & (cf.index < mature_end)
         # Reindex gaps before smoothing: noncontiguous healthy hours must not join episodes.
         full_index = pd.date_range(cal_start, mature_end, freq=cfg['step'], inclusive='left')[-cfg['calibration_limit']:]
-        e = model.errors(cf.loc[mask], cy.loc[mask])
+        with phase(f'{u} · ошибки калибровки'):
+            e = model.errors(cf.loc[mask], cy.loc[mask])
+            reference_error = reference.errors(cf.loc[mask], cy.loc[mask])
         errors[u] = e.reindex(full_index)
-        ref_errors[u] = reference.errors(cf.loc[mask], cy.loc[mask]).reindex(full_index)
+        ref_errors[u] = reference_error.reindex(full_index)
     scale = sensor_scale(pd.concat(errors.values()))
     ref_scale = sensor_scale(pd.concat(ref_errors.values()))
     rules = read_rules(cfg['sensor_rules'])
     groups = {col:rules.get('sensors', {}).get(col, {}).get('group', '') for col in model.targets}
     thresholds = {}
     for u, e in errors.items():
-        views, _ = score_views(e, scale, cfg, groups)
-        thresholds[u] = {view:{str(b):calibrate_threshold(data.smoothed, cfg, b) for b in cfg['alarm_budgets']}
-                         for view, data in views.items()}
+        with phase(f'{u} · подбор порогов тревог'):
+            views, _ = score_views(e, scale, cfg, groups)
+            thresholds[u] = {view:{str(b):calibrate_threshold(data.smoothed, cfg, b) for b in cfg['alarm_budgets']}
+                             for view, data in views.items()}
     audit.update(cutoff=str(cutoff), calibration_start=str(cal_start), mature_end=str(mature_end),
                  train_rows=int(train.sum()), validation_rows=int(val.sum()), calibration_rows=int(cal.sum()),
                  inherited_from=str(previous['cutoff']) if previous else None, trees=model.tree_counts(),
@@ -208,13 +222,81 @@ def score_context(state, context, spec, cfg):
     return views, matrices, e, interpretation_features
 
 
+def scoring_context(context, spec, cfg, start, end):
+    """Keep only a month and the history required by lags and rolling features.
+
+    Conditions, regimes and quality were already prepared on the full source, so
+    their ages/categorical histories are retained rather than restarted here.
+    """
+    hours=max(cfg['slow_hours']+cfg['smooth_hours'],48.,1.)+spec['horizon']
+    left=pd.Timestamp(start)-pd.Timedelta(hours=hours)-pd.Timedelta(cfg['step'])
+    take=(context['frame'].index>=left)&(context['frame'].index<pd.Timestamp(end))
+    return {key:(value.loc[take] if isinstance(value,(pd.DataFrame,pd.Series)) and
+                 value.index.equals(context['frame'].index) else value) for key,value in context.items()}
+
+
+def score_fingerprint(context, end, model_token):
+    digest=hashlib.sha256(model_token.encode())
+    frame=context['frame'].loc[lambda f:f.index<end]
+    digest.update(pd.util.hash_pandas_object(frame,index=True).to_numpy().tobytes())
+    for key in ('roles','aliases','declared_units'):
+        digest.update(json.dumps(context.get(key,{}),sort_keys=True,ensure_ascii=False).encode())
+    return digest.hexdigest()
+
+
+def score_month(state, context, spec, cfg, cutoff, end):
+    c=scoring_context(context,spec,cfg,cutoff,end)
+    views,_,errors,features=score_context(state,c,spec,cfg)
+    mask=(errors.index>=cutoff)&(errors.index<end)
+    diagnostics=[]
+    if hasattr(state['model'],'interval_diagnostics'):
+        f,y=dataset(c,spec['variant'],spec['horizon'],cfg)
+        diagnostics=[dict(month=str(cutoff),model_cutoff=str(state['cutoff']),**row)
+                     for row in state['model'].interval_diagnostics(f.loc[mask],y.loc[mask])]
+    thresholds=state['thresholds'].get(context['unit'])
+    if thresholds is None:
+        thresholds={view:{str(b):{'threshold':max(d[view][str(b)]['threshold']
+            for d in state['thresholds'].values())} for b in cfg['alarm_budgets']}
+            for view in views}
+    result={}
+    for view,scores in views.items():
+        scores=scores.loc[mask].copy()
+        scores['model_cutoff']=state['cutoff']
+        for budget in cfg['alarm_budgets']:
+            scores['threshold_budget_'+str(budget)]=thresholds[view][str(budget)]['threshold']
+        result[view]=scores
+    return dict(views=result,errors=errors.loc[mask],features=features.loc[mask],diagnostics=diagnostics)
+
+
 def run(cfg):
-    cfg = load(overrides=cfg)
-    root = Path(cfg['output']); root.mkdir(parents=True, exist_ok=True)
-    contexts, _ = load_sources(cfg, root/'audit')
-    summaries, statuses = [], []
-    for spec in experiments(cfg):
+    cfg=load(overrides=cfg)
+    # Large numbers of small BLAS solves can stall with an unrestricted thread
+    # pool. Apply the configured limit to the entire numerical lifecycle.
+    with numerical_threads(cfg['threads']):
+        return _run(cfg)
+
+
+def _run(cfg):
+    root=Path(cfg['output']);root.mkdir(parents=True,exist_ok=True)
+    progress=Progress(root)
+    with progress.stage('проверка зависимостей текущего Python'):
+        missing=[]
+        for name in ('numpy','pandas','scipy','scikit-learn','catboost','joblib','threadpoolctl','openpyxl','pyarrow','matplotlib'):
+            try:
+                importlib.metadata.version(name)
+            except importlib.metadata.PackageNotFoundError:
+                missing.append(name)
+        if missing:
+            raise RuntimeError('В текущем ядре '+sys.executable+' отсутствуют пакеты: '+', '.join(missing)+
+                               '. Установите зависимости в этом ядре: %pip install -r requirements.txt')
+    with progress.stage('загрузка данных и аудит'):
+        contexts,_=load_sources(cfg,root/'audit')
+    specs=list(experiments(cfg))
+    progress.say(f'Запланировано экспериментов: {len(specs)}. Модели сохраняются после каждого месячного среза.')
+    summaries,statuses=[],[]
+    for number,spec in enumerate(specs,1):
         name = '__'.join([spec['group'], spec['scenario'], '+'.join(spec['sources']), spec['method'], spec['variant'], str(spec['horizon'])])
+        progress.say(f'Эксперимент {number}/{len(specs)}: {name}',experiment=name)
         if any(c in name for c in '<>:"/\\|?*') or '..' in name:
             raise ValueError('Experiment names must be safe path components')
         dest = root/'experiments'/name; dest.mkdir(parents=True, exist_ok=True)
@@ -232,51 +314,63 @@ def run(cfg):
         pieces = {u:{} for u in spec['recipients']}
         error_parts, feature_parts, audit_rows = {u:[] for u in pieces}, {u:[] for u in pieces}, []
         prediction_diagnostics={u:[] for u in pieces}
-        for cutoff in months:
-            token = fingerprint(selected, cutoff, cfg, spec)
+        for month_number,cutoff in enumerate(months,1):
+            tag=f'{name} · месяц {month_number}/{len(months)} · {cutoff:%Y-%m}'
+            with progress.stage(tag+' · проверка сохранённого состояния'):
+                token = fingerprint(selected, cutoff, cfg, spec)
             path = dest/'checkpoints'/f'{cutoff:%Y-%m-%d}.joblib'
             if path.exists():
-                saved = joblib.load(path)
-                if saved.get('fingerprint') != token:
-                    raise ValueError(f'Changed past data, configuration or code: use a new output directory ({path})')
-                state = saved['state']; audit = dict(state['audit'], restored=True)
+                with progress.stage(tag+' · загрузка checkpoint'):
+                    saved = joblib.load(path)
+                    if saved.get('fingerprint') != token:
+                        raise ValueError(f'Changed past data, configuration or code: use a new output directory ({path})')
+                    state = saved['state']; audit = dict(state['audit'], restored=True)
             else:
-                new_state, audit = update_at(selected, spec, cutoff, cfg, state)
+                new_state, audit = update_at(selected, spec, cutoff, cfg, state,progress)
                 if new_state is not None:
                     state = new_state
-                    atomic_dump(dict(fingerprint=token, state=state), path)
+                    with progress.stage(tag+' · сохранение checkpoint'):
+                        atomic_dump(dict(fingerprint=token, state=state), path)
+            audit=dict(audit)
             audit_rows.append(audit)
-            print(name, cutoff.strftime('%Y-%m'), audit['status'], flush=True)
+            progress.say(tag+' · модель: '+audit['status'],status=audit['status'])
             if state is None:
+                progress.say('Модель пока не получена: '+json.dumps(audit,ensure_ascii=False,default=str))
+                pd.DataFrame(audit_rows).to_json(dest/'updates.json',orient='records',indent=2,force_ascii=False,date_format='iso')
                 continue
             end = cutoff+pd.offsets.MonthBegin(1)
             for u in spec['recipients']:
                 # Truncate inputs before scoring: no accidental future-dependent features.
                 c = selected[u]
                 from .runtime import export
-                export(state,c,spec,cfg,dest/u/'model_history'/f'{cutoff:%Y-%m}')
-                take = c['frame'].index < end
-                truncated = {k:(v.loc[take] if isinstance(v, (pd.DataFrame,pd.Series)) and v.index.equals(c['frame'].index) else v) for k,v in c.items()}
-                views, matrices, e, features = score_context(state, truncated, spec, cfg)
-                mask = (e.index >= cutoff) & (e.index < end)
-                if hasattr(state['model'],'interval_diagnostics'):
-                    ff,yy=dataset(truncated,spec['variant'],spec['horizon'],cfg)
-                    for diagnostic in state['model'].interval_diagnostics(ff.loc[mask],yy.loc[mask]):
-                        prediction_diagnostics[u].append(dict(month=str(cutoff),model_cutoff=str(state['cutoff']),**diagnostic))
-                for view, scores in views.items():
-                    scores = scores.loc[mask].copy()
-                    scores['model_cutoff'] = state['cutoff']
-                    for b in cfg['alarm_budgets']:
-                        donor_ts = state['thresholds'].get(u) or next(iter(state['thresholds'].values()))
-                        threshold = (donor_ts[view][str(b)]['threshold'] if u in state['thresholds'] else
-                                     max(d[view][str(b)]['threshold'] for d in state['thresholds'].values()))
-                        scores['threshold_budget_'+str(b)] = threshold
+                history=dest/u/'model_history'/f'{cutoff:%Y-%m}'
+                current=dest/u/'model'
+                with progress.stage(tag+f' · {u} · экспорт модели для дашборда'):
+                    if not export_ready(history,token):
+                        export(state,c,spec,cfg,history,fingerprint=token)
+                    if not export_ready(current,token):
+                        publish_export(history,current)
+                    record_export(root,name,u,spec,state,cutoff,current,history)
+                progress.say('Готовая модель для дашборда: '+str(current.resolve()),model_dir=str(current.resolve()))
+                cached=dest/'scored'/f'{cutoff:%Y-%m-%d}'/(u+'.joblib')
+                with progress.stage(tag+f' · {u} · оценки месяца и признаки'):
+                    score_token=score_fingerprint(c,end,token)
+                    saved=joblib.load(cached) if cached.exists() else None
+                    if saved and saved.get('fingerprint')==score_token:
+                        month=saved['month']
+                        progress.say('Восстановлены сохранённые оценки месяца: '+str(cached))
+                    else:
+                        month=score_month(state,c,spec,cfg,cutoff,end)
+                        atomic_dump(dict(fingerprint=score_token,month=month),cached)
+                prediction_diagnostics[u].extend(month['diagnostics'])
+                for view,scores in month['views'].items():
                     pieces[u].setdefault(view, []).append(scores)
-                error_parts[u].append(e.loc[mask]); feature_parts[u].append(features.loc[mask])
+                error_parts[u].append(month['errors']);feature_parts[u].append(month['features'])
+            pd.DataFrame(audit_rows).to_json(dest/'updates.json',orient='records',indent=2,force_ascii=False,date_format='iso')
+            progress.say(tag+' · расчёт месяца завершён',status='month_complete')
         pd.DataFrame(audit_rows).to_json(dest/'updates.json', orient='records', indent=2, force_ascii=False, date_format='iso')
         if state is None:
             statuses.append(dict(experiment=name, status='insufficient_history')); continue
-        from .runtime import export
         from .interpretation import write_catalog
         for u in spec['recipients']:
             ud = dest/u; ud.mkdir(exist_ok=True)
@@ -285,28 +379,30 @@ def run(cfg):
             residuals.to_parquet(ud/'prequential_errors.parquet')
             pd.DataFrame(prediction_diagnostics[u]).to_csv(ud/'prediction_diagnostics.csv',index=False,encoding='utf-8-sig')
             timeline_features.to_parquet(ud/'interpretation_features.parquet')
-            timelines = {}
-            for view, parts in pieces[u].items():
-                data = pd.concat(parts).sort_index()
-                # Persistence is continuous across month boundaries, without resetting a live alarm.
-                for b in cfg['alarm_budgets']:
-                    threshold = data['threshold_budget_'+str(b)]
-                    ratio = data.smoothed/threshold.where(np.isfinite(threshold))
-                    stream, episodes = alarm_stream(ratio, cfg)
-                    scored = data.assign(ratio=ratio, active=stream.active, notification=stream.notification)
-                    metrics, events = evaluate(scored, selected[u]['events'], cfg, start=first)
-                    summaries.append(dict(experiment=name, unit=u, view=view, budget=b, **metrics))
-                    slug = view.replace(':','_')+'__'+str(b)
-                    scored.to_parquet(ud/(slug+'.parquet'))
-                    episodes.to_csv(ud/(slug+'_alarms.csv'), index=False, encoding='utf-8-sig')
-                    events.to_csv(ud/(slug+'_events.csv'), index=False, encoding='utf-8-sig')
-                    if b == cfg['alarm_budget']:
-                        timelines[view] = scored
-            write_catalog(timelines, timeline_features, selected[u], cfg, ud)
-            export(state, selected[u], spec, cfg, ud/'model')
+            with progress.stage(name+f' · {u} · тревоги, метрики и отчёты'):
+                timelines = {}
+                for view, parts in pieces[u].items():
+                    data = pd.concat(parts).sort_index()
+                    # Persistence remains continuous across month boundaries.
+                    for b in cfg['alarm_budgets']:
+                        threshold = data['threshold_budget_'+str(b)]
+                        ratio = data.smoothed/threshold.where(np.isfinite(threshold))
+                        stream, episodes = alarm_stream(ratio, cfg)
+                        scored = data.assign(ratio=ratio, active=stream.active, notification=stream.notification)
+                        metrics, events = evaluate(scored, selected[u]['events'], cfg, start=first)
+                        summaries.append(dict(experiment=name, unit=u, view=view, budget=b, **metrics))
+                        slug = view.replace(':','_')+'__'+str(b)
+                        scored.to_parquet(ud/(slug+'.parquet'))
+                        episodes.to_csv(ud/(slug+'_alarms.csv'), index=False, encoding='utf-8-sig')
+                        events.to_csv(ud/(slug+'_events.csv'), index=False, encoding='utf-8-sig')
+                        if b == cfg['alarm_budget']:
+                            timelines[view] = scored
+                write_catalog(timelines, timeline_features, selected[u], cfg, ud)
             statuses.append(dict(experiment=name, unit=u, status='complete', model=str(ud/'model')))
         pd.DataFrame(summaries).to_csv(root/'comparison.csv', index=False, encoding='utf-8-sig')
     pd.DataFrame(statuses).to_csv(root/'status.csv', index=False, encoding='utf-8-sig')
     from .comparison import common_comparison
-    common_comparison(root,contexts,cfg)
+    with progress.stage('итоговое сравнение на общих часах'):
+        common_comparison(root,contexts,cfg)
+    progress.say('Расчёт завершён. Список готовых моделей: '+str((root/'models.csv').resolve()),status='complete')
     return dict(summary=pd.DataFrame(summaries), status=pd.DataFrame(statuses))

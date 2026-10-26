@@ -141,16 +141,21 @@ def map_frame(raw, rows, unit):
         if hits[0] in mapping:
             raise ValueError(f'{unit}: одному датчику назначено несколько общих параметров: {hits[0]}')
         mapping[hits[0]] = row['key']; roles[row['key']] = row['role']; units[row['key']] = row['units']
-    out = raw[list(mapping)].rename(columns=mapping).copy()
+    # Construct the frame once: replacing hundreds of columns separately leaves
+    # one pandas block per column and makes even metadata insertion expensive.
+    columns = {}
+    originals = {key: original for original, key in mapping.items()}
     for key, role in roles.items():
+        values = raw[originals[key]]
         if role == 'state':
-            out[key] = out[key].astype('category')
+            columns[key] = values.astype('category')
         else:
-            out[key] = pd.to_numeric(out[key].astype(str).str.replace(',', '.', regex=False), errors='coerce')
-            out[key] = out[key].replace([np.inf, -np.inf], np.nan)
+            values = pd.to_numeric(values.astype(str).str.replace(',', '.', regex=False), errors='coerce')
+            columns[key] = values.replace([np.inf, -np.inf], np.nan)
     for key in (K.STATE_COL, '_Тип'):
         if key in raw:
-            out[key] = raw[key]
+            columns[key] = raw[key]
+    out = pd.DataFrame(columns, index=raw.index)
     if K.STATE_COL not in out:
         raise ValueError(f'{unit}: нет столбца {K.STATE_COL}')
     return out, roles, units, mapping, audit

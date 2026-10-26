@@ -74,22 +74,22 @@ def clean(frame, targets, rules, step='1h'):
 
 def conditions(frame, roles, regime, unit, step='1h'):
     cols = [c for c, r in roles.items() if r in ('load', 'condition', 'state')]
-    f = frame.reindex(columns=cols).copy()
-    f['unit'] = str(unit)
-    f['since_start_hours'] = regime.since_start_hours.clip(upper=720)
-    f['load_missing'] = regime.load_missing.astype(float)
+    columns = {c:frame[c] for c in cols}
+    columns['unit'] = str(unit)
+    columns['since_start_hours'] = regime.since_start_hours.clip(upper=720)
+    columns['load_missing'] = regime.load_missing.astype(float)
     n = max(1, int(round(pd.Timedelta('1h') / pd.Timedelta(step))))
     for c, role in roles.items():
         if role in ('condition', 'load'):
-            f[c+'::delta_1h'] = pd.to_numeric(frame[c], errors='coerce').diff(n)
-    f['month_sin'] = np.sin(2*np.pi*frame.index.month/12)
-    f['month_cos'] = np.cos(2*np.pi*frame.index.month/12)
+            columns[c+'::delta_1h'] = pd.to_numeric(frame[c], errors='coerce').diff(n)
+    columns['month_sin'] = np.sin(2*np.pi*frame.index.month/12)
+    columns['month_cos'] = np.cos(2*np.pi*frame.index.month/12)
     for c in [c for c, r in roles.items() if r == 'state']:
         value = frame[c].astype(object)
         group = value.ne(value.shift()).cumsum()
-        f[c+'::held_hours'] = value.groupby(group).cumcount() * pd.Timedelta(step)/pd.Timedelta('1h')
-        f[c] = value.fillna('__MISSING__').astype(str)
-    return f
+        columns[c+'::held_hours'] = value.groupby(group).cumcount() * pd.Timedelta(step)/pd.Timedelta('1h')
+        columns[c] = value.fillna('__MISSING__').astype(str)
+    return pd.DataFrame(columns,index=frame.index)
 
 
 @dataclass

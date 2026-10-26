@@ -10,16 +10,17 @@ from .preparation import FrozenEncoder
 
 def episode_features(errors, context, cfg):
     e = errors
-    f = pd.DataFrame(index=e.index)
-    f['mean_abs'] = e.abs().mean(axis=1)
-    f['max_abs'] = e.abs().max(axis=1)
+    a=e.abs()
+    f = {}
+    f['mean_abs'] = a.mean(axis=1)
+    f['max_abs'] = a.max(axis=1)
     f['signed_mean'] = e.mean(axis=1)
     f['coverage'] = e.notna().mean(axis=1)
     f['fraction_above_1'] = e.abs().gt(1).where(e.notna()).mean(axis=1)
     for h in (6, 24, 48):
-        f[f'mean_abs_{h}h'] = f.mean_abs.rolling(f'{h}h', min_periods=1).mean()
+        f[f'mean_abs_{h}h'] = f['mean_abs'].rolling(f'{h}h', min_periods=1).mean()
         f[f'persistent_{h}h'] = e.rolling(f'{h}h', min_periods=1).mean().abs().mean(axis=1)
-    f['growth_1h'] = f.mean_abs.diff(max(1, int(pd.Timedelta('1h')/pd.Timedelta(cfg['step']))))
+    f['growth_1h'] = f['mean_abs'].diff(max(1, int(pd.Timedelta('1h')/pd.Timedelta(cfg['step']))))
     for flag in ('missing','spike','frozen','masked'):
         f['quality_'+flag] = context['quality'].xs(flag, axis=1, level=1).mean(axis=1)
     load = context['frame'][context['load']]
@@ -32,7 +33,7 @@ def episode_features(errors, context, cfg):
             f[c] = values.fillna('__MISSING__').astype(str)
             f[c+'::change'] = (values.notna() & values.shift().notna() & values.ne(values.shift())).astype(float)
     f['unit'] = context['unit']
-    return f
+    return pd.DataFrame(f,index=e.index)
 
 
 def write_catalog(timelines, features, context, cfg, dest):

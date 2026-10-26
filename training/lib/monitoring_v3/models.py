@@ -241,11 +241,12 @@ class NormalModel:
 
     def candidate(self, features, targets, validation_f, validation_y):
         candidate = deepcopy(self).update(features, targets)
-        old = self.errors(validation_f, validation_y).abs().median().median()
-        new = candidate.errors(validation_f, validation_y).abs().median().median()
         # Compare reconstruction in physical units as well: inflating uncertainty is no improvement.
-        om, _ = self.expected(validation_f, validation_y)
-        nm, _ = candidate.expected(validation_f, validation_y)
+        om, oscale = self.expected(validation_f, validation_y)
+        nm, nscale = candidate.expected(validation_f, validation_y)
+        actual=validation_y.reindex(columns=self.targets)
+        old = actual.sub(om).div(oscale).replace([np.inf,-np.inf],np.nan).abs().median().median()
+        new = actual.sub(nm).div(nscale).replace([np.inf,-np.inf],np.nan).abs().median().median()
         oe = validation_y.sub(om).abs().div(self.scale).median().median()
         ne = validation_y.sub(nm).abs().div(self.scale).median().median()
         accepted = bool(np.isfinite(ne) and (not np.isfinite(oe) or ne <= max(oe, 1e-6)*(1+self.cfg['validation_tolerance'])))
