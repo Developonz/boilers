@@ -1,5 +1,4 @@
 """Resumable chronological experiments with honest current-version calibration."""
-from copy import deepcopy
 from contextlib import nullcontext
 from pathlib import Path
 import hashlib
@@ -12,7 +11,7 @@ import numpy as np
 import pandas as pd
 from .config import load
 from .data import load_sources, healthy, read_rules
-from .models import NormalModel, RelatedModel, AnalogCorrection, MultiTargetModel, balanced_rows
+from .models import NormalModel, RelatedModel, AnalogCorrection, MultiTargetModel, balanced_rows, snapshot_model
 from .alarm_scores import sensor_scale, score_views, calibrate_threshold, alarm_stream, evaluate
 from .progress import Progress
 from .artifacts import export_ready, publish_export, record_export
@@ -140,7 +139,7 @@ def update_at(contexts, spec, cutoff, cfg, previous=None, progress=None):
                  MultiTargetModel(spec['method'],cfg) if spec['method'] == 'CatBoostMulti' else NormalModel(spec['method'], cfg))
         with phase(f'первоначальное обучение: {int(train.sum())} строк, {len(y.columns)} целей'):
             model.fit_initial(f.loc[train], y.loc[train])
-            reference = deepcopy(model)
+            reference = snapshot_model(model)
         ingested = set(f.index[train].tolist())
         audit = dict(status='initial', accepted=True, new_rows=int(train.sum()))
     else:
@@ -174,8 +173,9 @@ def update_at(contexts, spec, cutoff, cfg, previous=None, progress=None):
         mask = (cf.index >= cal_start) & (cf.index < mature_end)
         # Reindex gaps before smoothing: noncontiguous healthy hours must not join episodes.
         full_index = pd.date_range(cal_start, mature_end, freq=cfg['step'], inclusive='left')[-cfg['calibration_limit']:]
-        with phase(f'{u} · ошибки калибровки'):
+        with phase(f'{u} · ошибки калибровки · обновляемая модель'):
             e = model.errors(cf.loc[mask], cy.loc[mask])
+        with phase(f'{u} · ошибки калибровки · исходная эталонная модель'):
             reference_error = reference.errors(cf.loc[mask], cy.loc[mask])
         errors[u] = e.reindex(full_index)
         ref_errors[u] = reference_error.reindex(full_index)

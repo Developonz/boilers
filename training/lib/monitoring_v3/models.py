@@ -6,6 +6,30 @@ from .preparation import FrozenEncoder
 from .progress import phase,PredictionProgress,current_progress
 
 
+def snapshot_model(model):
+    """Copy mutable pipeline state, retaining immutable fitted CatBoost estimators.
+
+    Every continuation fits a NEW estimator with init_model; it never calls fit
+    on a retained estimator. Avoid CatBoost.__deepcopy__ and its native reload
+    path before continuation (upstream issue catboost/catboost#2905).
+    """
+    from catboost import CatBoost
+    memo={};seen=set()
+    def preserve(value):
+        if id(value) in seen:return
+        seen.add(id(value))
+        if isinstance(value,CatBoost):
+            memo[id(value)]=value
+        elif isinstance(value,dict):
+            for child in value.values():preserve(child)
+        elif isinstance(value,(list,tuple)):
+            for child in value:preserve(child)
+        elif isinstance(value,(NormalModel,RelatedModel,AnalogCorrection)):
+            preserve(vars(value))
+    preserve(model)
+    return deepcopy(model,memo)
+
+
 def balanced_rows(features, limit):
     """Deterministic coverage of load ranges, units and categorical operating states."""
     if len(features) <= limit:
@@ -297,7 +321,7 @@ class NormalModel:
 
     def candidate(self, features, targets, validation_f, validation_y):
         with phase('копирование предыдущей модели'):
-            candidate = deepcopy(self)
+            candidate = snapshot_model(self)
         with phase('дообучение кандидата'):
             candidate.update(features, targets)
         if not self.cfg.get('validate_candidate',True):
