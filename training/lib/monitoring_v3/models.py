@@ -3,6 +3,7 @@ from copy import deepcopy
 import numpy as np
 import pandas as pd
 from .preparation import FrozenEncoder
+from .progress import phase,PredictionProgress,current_progress
 
 
 def balanced_rows(features, limit):
@@ -167,10 +168,11 @@ class NormalModel:
         if self.method == 'HistGradientBoosting':
             return self
         if self.method == 'CatBoost':
-            keep = balanced_rows(self.memory_f, self.cfg['replay_rows'])
-            # Real dates must be ordered across units too (MultiIndex: time, unit).
-            combined_f = pd.concat([self.memory_f.iloc[keep], features]).sort_index(kind='stable')
-            combined_y = pd.concat([self.memory_y.iloc[keep], targets]).reindex(combined_f.index)
+            with phase('подготовка новых строк и старых примеров'):
+                keep = balanced_rows(self.memory_f, self.cfg['replay_rows'])
+                # Real dates must be ordered across units too (MultiIndex: time, unit).
+                combined_f = pd.concat([self.memory_f.iloc[keep], features]).sort_index(kind='stable')
+                combined_y = pd.concat([self.memory_y.iloc[keep], targets]).reindex(combined_f.index)
             self._fit_trees(combined_f, combined_y, initial=False)
         else:
             c = self.encoder.numeric(features)
@@ -181,14 +183,15 @@ class NormalModel:
             beta = self.stats.update(f, targets.to_numpy(float))
             if self.method != 'analogs':
                 self.kernel.lin.beta = beta
-        self.counts += targets.count().to_numpy()
-        self.memory_f = pd.concat([self.memory_f, features])
-        self.memory_y = pd.concat([self.memory_y, targets])
-        keep = balanced_rows(self.memory_f, self.cfg['memory_rows'])
-        self.memory_f, self.memory_y = self.memory_f.iloc[keep], self.memory_y.iloc[keep]
-        if self.method != 'CatBoost':
-            self._rebuild_memory()
-        self.updates += 1
+        with phase(f'обновление памяти примеров: лимит {self.cfg["memory_rows"]} строк'):
+            self.counts += targets.count().to_numpy()
+            self.memory_f = pd.concat([self.memory_f, features])
+            self.memory_y = pd.concat([self.memory_y, targets])
+            keep = balanced_rows(self.memory_f, self.cfg['memory_rows'])
+            self.memory_f, self.memory_y = self.memory_f.iloc[keep], self.memory_y.iloc[keep]
+            if self.method != 'CatBoost':
+                self._rebuild_memory()
+            self.updates += 1
         return self
 
     def _rebuild_memory(self):
@@ -205,24 +208,41 @@ class NormalModel:
             m.Mx = ((residual-m.xm)/m.xs).astype(np.float32)
             m.Mc = m._cond(c, np.empty((len(c), 0))).astype(np.float32)
 
-    def expected(self, features, actual):
+    def _tree_prediction_input(self, features):
+        """One transient input per batch; never retain a native Pool in model state."""
+        with phase(f'подготовка входов прогноза {self.method}: {len(features)} строк, {len(features.columns)} входов'):
+            if self.method == 'CatBoost':
+                from catboost import Pool
+                return Pool(self.encoder.native(features),cat_features=list(self.encoder.categories),
+                            thread_count=self.cfg['threads'])
+            return self.encoder.numeric(features)
+
+    def expected(self, features, actual, *, prediction_input=None):
         n, p = len(features), len(self.targets)
         med, spread = np.full((n, p), np.nan), np.full((n, p), np.nan)
         if self.method in ('CatBoost', 'HistGradientBoosting'):
-            native = self.encoder.native(features)
+            tree_input=prediction_input
+            if n and tree_input is None and any(kind in ('catboost','hist') for kind,_ in self.predictors.values()):
+                tree_input=self._tree_prediction_input(features)
+            reporter=PredictionProgress(p,n)
             for j, col in enumerate(self.targets):
+                if not n:break
+                reporter.start(j+1,col)
                 item = self.predictors.get(col)
                 if item is None:
+                    reporter.done('no_model')
                     continue
                 kind, model = item
                 if kind in ('constant','reference'):
                     med[:, j], spread[:, j] = model, self.scale[j]
+                    reporter.done(kind)
                     continue
-                pred = (model.predict(native,thread_count=self.cfg['threads']) if kind == 'catboost' else
-                        np.column_stack([m.predict(self.encoder.numeric(features)) for m in model]))
+                pred = (model.predict(tree_input,thread_count=self.cfg['threads']) if kind == 'catboost' else
+                        np.column_stack([m.predict(tree_input) for m in model]))
                 # Sorting repairs crossing; interval diagnostics are reported separately.
                 pred = np.sort(pred, axis=1)
                 med[:, j], spread[:, j] = pred[:, 1], np.maximum((pred[:, 2]-pred[:, 0])/1.349, self.floor[j])
+                reporter.done()
         else:
             c = self.encoder.numeric(features)
             if self.method == 'analogs':
@@ -253,12 +273,17 @@ class NormalModel:
         rows=[]
         if self.method not in ('CatBoost','HistGradientBoosting'):
             return rows
-        native=self.encoder.native(features)
-        for col,(kind,model) in self.predictors.items():
+        if not len(features):return rows
+        tree_input=(self._tree_prediction_input(features)
+                    if any(kind in ('catboost','hist') for kind,_ in self.predictors.values()) else None)
+        reporter=PredictionProgress(len(self.predictors),len(features))
+        for j,(col,(kind,model)) in enumerate(self.predictors.items(),1):
             if kind in ('constant','reference'):
                 continue
-            pred=(model.predict(native,thread_count=self.cfg['threads']) if kind=='catboost' else
-                  np.column_stack([m.predict(self.encoder.numeric(features)) for m in model]))
+            reporter.start(j,col)
+            pred=(model.predict(tree_input,thread_count=self.cfg['threads']) if kind=='catboost' else
+                  np.column_stack([m.predict(tree_input) for m in model]))
+            reporter.done('interval_diagnostics')
             good=actual[col].notna().to_numpy() & np.isfinite(pred).all(axis=1)
             if not good.any():
                 continue
@@ -271,19 +296,42 @@ class NormalModel:
         return rows
 
     def candidate(self, features, targets, validation_f, validation_y):
-        candidate = deepcopy(self).update(features, targets)
+        with phase('копирование предыдущей модели'):
+            candidate = deepcopy(self)
+        with phase('дообучение кандидата'):
+            candidate.update(features, targets)
+        if not self.cfg.get('validate_candidate',True):
+            progress=current_progress()
+            if progress:
+                progress.say('Обновление принято без проверки кандидата',status='candidate_validation_disabled',accepted=True)
+            return candidate,dict(accepted=True,validation_status='disabled',trees=candidate.tree_counts())
+        shared={}
+        # Only ordinary CatBoost shares an input schema across both complete
+        # models. Related/Correction/Multi keep their own prediction contracts.
+        if (type(self) is NormalModel and self.method=='CatBoost' and len(validation_f) and
+            any(kind=='catboost' for model in (self,candidate) for kind,_ in model.predictors.values())):
+            with phase('подготовка общих проверочных входов'):
+                shared['prediction_input']=self._tree_prediction_input(validation_f)
         # Compare reconstruction in physical units as well: inflating uncertainty is no improvement.
-        om, oscale = self.expected(validation_f, validation_y)
-        nm, nscale = candidate.expected(validation_f, validation_y)
-        actual=validation_y.reindex(columns=self.targets)
-        old = actual.sub(om).div(oscale).replace([np.inf,-np.inf],np.nan).abs().median().median()
-        new = actual.sub(nm).div(nscale).replace([np.inf,-np.inf],np.nan).abs().median().median()
-        oe = validation_y.sub(om).abs().div(self.scale).median().median()
-        ne = validation_y.sub(nm).abs().div(self.scale).median().median()
-        accepted = bool(np.isfinite(ne) and (not np.isfinite(oe) or ne <= max(oe, 1e-6)*(1+self.cfg['validation_tolerance'])))
+        with phase(f'проверочные прогнозы старой модели: {len(validation_f)} строк'):
+            om, oscale = self.expected(validation_f, validation_y,**shared)
+        with phase(f'проверочные прогнозы новой модели: {len(validation_f)} строк'):
+            nm, nscale = candidate.expected(validation_f, validation_y,**shared)
+        with phase('сравнение ошибок и решение об обновлении'):
+            actual=validation_y.reindex(columns=self.targets)
+            old = actual.sub(om).div(oscale).replace([np.inf,-np.inf],np.nan).abs().median().median()
+            new = actual.sub(nm).div(nscale).replace([np.inf,-np.inf],np.nan).abs().median().median()
+            oe = validation_y.sub(om).abs().div(self.scale).median().median()
+            ne = validation_y.sub(nm).abs().div(self.scale).median().median()
+            accepted = bool(np.isfinite(ne) and (not np.isfinite(oe) or ne <= max(oe, 1e-6)*(1+self.cfg['validation_tolerance'])))
+            progress=current_progress()
+            if progress:
+                progress.say(('Кандидат принят' if accepted else 'Кандидат отклонён')+
+                    f': ошибка старой модели {oe:.6g}, новой {ne:.6g}',status='candidate_decision',
+                    accepted=accepted,old_physical_error=float(oe),new_physical_error=float(ne))
         return candidate if accepted else self, dict(accepted=accepted, old_error=float(old), new_error=float(new),
                                                     old_physical_error=float(oe), new_physical_error=float(ne),
-                                                    trees=candidate.tree_counts())
+                                                    validation_status='checked',trees=candidate.tree_counts())
 
 
 class RelatedModel:

@@ -172,11 +172,13 @@ class TargetProgress:
         if self.progress:
             self.progress.set_detail(self.label+' · подготовка / начало fit')
             self.progress.say(self.label+f' · начало, {rows} пригодных строк, до {trees} деревьев',
-                              status='target_started',target=name,target_index=index,target_count=self.count,rows=int(rows))
+                              status='target_started',target=name,target_index=index,target_count=self.count,
+                              rows=int(rows),iterations=trees)
 
     def after_iteration(self, info):
         if self.progress:
-            self.progress.set_detail(self.label+f' · деревья {info.iteration}/{self.iterations}')
+            self.progress.set_detail(self.label+f' · деревья {info.iteration}/{self.iterations}',
+                                     iteration=int(info.iteration),iterations=self.iterations)
         return True
 
     def done(self, status, cached=False):

@@ -19,7 +19,7 @@ DEFAULTS = dict(
     minimum_coverage=.7, smooth_hours=6, slow_hours=48, persist_hours=3,
     merge_hours=12, alarm_budgets=[.5, 1., 2.], alarm_budget=1.,
     max_background_fraction=.05, pre_window_days=7, neutral_days=7, min_lead_hours=3,
-    validation_tolerance=.25, validate_rows=168, schema_version=1,
+    validation_tolerance=.25, validate_rows=168, validate_candidate=True, schema_version=1,
     scenarios=['local'], related_inputs={}, risk_horizons=[24, 168],
 )
 
@@ -35,6 +35,8 @@ def load(path=None, overrides=None):
     unknown = set(cfg) - set(DEFAULTS)
     if unknown:
         raise ValueError(f'Unknown configuration keys: {sorted(unknown)}')
+    if not isinstance(cfg['validate_candidate'],bool):
+        raise ValueError('validate_candidate must be True or False')
     step=pd.Timedelta(cfg['step'])
     if not pd.Timedelta(0)<step<=pd.Timedelta('1h') or pd.Timedelta('1h')%step!=pd.Timedelta(0):
         raise ValueError('step must divide one hour and be at most one hour')

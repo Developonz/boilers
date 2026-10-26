@@ -156,11 +156,14 @@ def update_at(contexts, spec, cutoff, cfg, previous=None, progress=None):
         elif model.tree_counts() and all(n+cfg['cb_update_trees']>cfg['cb_max_trees'] for n in model.tree_counts().values()):
             audit = dict(status='tree_capacity_reached',accepted=False,new_rows=0,trees=model.tree_counts())
         else:
-            # Gate on unseen recent validation AND representation of old operating modes.
-            old = reference.memory_f.iloc[balanced_rows(reference.memory_f, min(100, cfg['replay_rows']))]
-            old_y = reference.memory_y.reindex(old.index)
-            vf, vy = pd.concat([f.loc[val], old]).sort_index(), pd.concat([y.loc[val], old_y]).sort_index()
-            with phase(f'обновление и проверка кандидата: {len(nf)} новых строк'):
+            vf=vy=None
+            if cfg['validate_candidate']:
+                # Gate on unseen recent validation AND representation of old operating modes.
+                old = reference.memory_f.iloc[balanced_rows(reference.memory_f, min(100, cfg['replay_rows']))]
+                old_y = reference.memory_y.reindex(old.index)
+                vf, vy = pd.concat([f.loc[val], old]).sort_index(), pd.concat([y.loc[val], old_y]).sort_index()
+            label='обновление и проверка кандидата' if cfg['validate_candidate'] else 'обновление без проверки кандидата'
+            with phase(f'{label}: {len(nf)} новых строк'):
                 model, audit = model.candidate(nf, ny, vf, vy)
             audit.update(status='updated' if audit['accepted'] else 'candidate_rejected', new_rows=len(nf))
             if audit['accepted']:
