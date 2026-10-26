@@ -89,29 +89,56 @@ class NormalModel:
 
     def _fit_trees(self, features, targets, initial):
         from .threads import numerical_threads
+        from .progress import current_progress
+        from .target_training import TargetProgress,current_store
         native = self.encoder.native(features)
         cats = list(self.encoder.categories)
+        reporter=TargetProgress(current_progress(),self.method,len(self.targets),initial)
+        reporter.inputs(native,cats,self.cfg)
+        store=current_store() if initial else None
+        scope=store.scope(self.method,native,targets,self.cfg) if store else None
+        variation={}
         for j, col in enumerate(self.targets):
             good = targets[col].notna() & np.isfinite(targets[col])
+            trees=self.cfg['cb_initial_trees'] if initial else self.cfg['cb_update_trees']
+            reporter.start(j+1,col,int(good.sum()),trees)
+            saved=store.restore(scope,col) if store else None
+            if saved is not None:
+                if saved['predictor'] is not None:self.predictors[col]=saved['predictor']
+                reporter.done(saved['status'],cached=True)
+                continue
             if good.sum() < self.cfg['min_sensor_rows']:
+                if store:store.save(scope,col,None,'insufficient_data')
+                reporter.done('insufficient_data')
                 continue
             y = targets.loc[good, col].to_numpy(float)
             if np.ptp(y) <= 1e-12:
                 # No tree can learn variation that has never been observed.
                 self.predictors.setdefault(col, ('constant', float(np.median(y))))
+                if store:store.save(scope,col,self.predictors[col],'constant')
+                reporter.done('constant')
                 continue
-            if not native.loc[good].nunique(dropna=False).gt(1).any():
+            mask_key=np.packbits(good.to_numpy()).tobytes()
+            if mask_key not in variation:
+                # Usually load is already variable: do not scan every input of
+                # a wide forecast matrix again for every target.
+                variation[mask_key]=any(native.loc[good,c].nunique(dropna=False)>1 for c in native.columns)
+            if not variation[mask_key]:
                 self.predictors.setdefault(col,('reference',float(np.median(y))))
+                if store:store.save(scope,col,self.predictors[col],'constant_inputs')
+                reporter.done('constant_inputs')
                 continue
             previous = self.predictors.get(col)
             if self.method == 'HistGradientBoosting':
                 if not initial:
+                    reporter.done('frozen_baseline')
                     continue  # Frozen comparison baseline, never described as incremental.
                 from sklearn.ensemble import HistGradientBoostingRegressor
                 with numerical_threads(self.cfg['threads']):
+                    numeric=self.encoder.numeric(features.loc[good])
                     models = [HistGradientBoostingRegressor(loss='quantile', quantile=a,
                               max_iter=self.cfg['cb_initial_trees'], max_depth=self.cfg['cb_depth'],
-                              early_stopping=False, random_state=self.cfg['seed']).fit(self.encoder.numeric(features.loc[good]), y)
+                              early_stopping=False, random_state=self.cfg['seed']).fit(numeric, y)
                               for a in (.25, .5, .75)]
                 self.predictors[col] = ('hist', models)
             else:
@@ -119,13 +146,17 @@ class NormalModel:
                 old = previous[1] if previous and previous[0] == 'catboost' else None
                 trees = self.cfg['cb_initial_trees'] if initial else self.cfg['cb_update_trees']
                 if old is not None and old.tree_count_+trees > self.cfg['cb_max_trees']:
+                    reporter.done('tree_capacity_reached')
                     continue
                 model = CatBoostRegressor(loss_function='MultiQuantile:alpha=0.25,0.5,0.75',
                     iterations=trees, depth=self.cfg['cb_depth'], learning_rate=self.cfg['learning_rate'],
                     random_seed=self.cfg['seed'], thread_count=self.cfg['threads'],
                     has_time=True, allow_writing_files=False, verbose=False, task_type='CPU')
-                model.fit(native.loc[good], y, cat_features=cats, init_model=old)
+                callbacks={'callbacks':[reporter]} if reporter.progress else {}
+                model.fit(native.loc[good], y, cat_features=cats, init_model=old,**callbacks)
                 self.predictors[col] = ('catboost', model)
+            if store:store.save(scope,col,self.predictors[col],'trained')
+            reporter.done('trained')
 
     def update(self, features, targets):
         """Input contains ONLY newly admitted rows, never the previous full training window."""

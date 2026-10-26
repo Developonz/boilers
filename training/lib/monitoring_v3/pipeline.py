@@ -17,6 +17,7 @@ from .alarm_scores import sensor_scale, score_views, calibrate_threshold, alarm_
 from .progress import Progress
 from .artifacts import export_ready, publish_export, record_export
 from .threads import numerical_threads
+from .target_training import initial_targets
 
 
 def atomic_dump(value, path):
@@ -326,7 +327,10 @@ def _run(cfg):
                         raise ValueError(f'Changed past data, configuration or code: use a new output directory ({path})')
                     state = saved['state']; audit = dict(state['audit'], restored=True)
             else:
-                new_state, audit = update_at(selected, spec, cutoff, cfg, state,progress)
+                recovery=(initial_targets(dest/'partial'/f'{cutoff:%Y-%m-%d}',token)
+                          if state is None else nullcontext())
+                with recovery:
+                    new_state, audit = update_at(selected, spec, cutoff, cfg, state,progress)
                 if new_state is not None:
                     state = new_state
                     with progress.stage(tag+' · сохранение checkpoint'):

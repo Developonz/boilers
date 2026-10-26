@@ -1,10 +1,17 @@
 """Local phase timings and periodic output during long numerical operations."""
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from threading import Event, Lock, Thread
 import json
 import time
 import uuid
+
+_active=ContextVar('training_progress',default=None)
+
+
+def current_progress():
+    return _active.get()
 
 
 class Progress:
@@ -15,6 +22,11 @@ class Progress:
         self.started=time.perf_counter()
         self.run_id=uuid.uuid4().hex
         self.lock=Lock()
+        self.detail=''
+
+    def set_detail(self, text):
+        with self.lock:
+            self.detail=text
 
     def say(self, message, **fields):
         with self.lock:
@@ -27,11 +39,16 @@ class Progress:
     @contextmanager
     def stage(self, label):
         started=time.perf_counter()
+        token=_active.set(self)
+        self.set_detail('')
         self.say('Начало: '+label,phase=label,status='started')
         stop=Event()
         def heartbeat():
             while not stop.wait(self.interval):
-                self.say(f'Выполняется: {label} · {time.perf_counter()-started:.0f} с',
+                with self.lock:
+                    detail=self.detail
+                suffix=' · '+detail if detail else ''
+                self.say(f'Выполняется: {label}{suffix} · {time.perf_counter()-started:.0f} с',
                          phase=label,status='running')
         thread=Thread(target=heartbeat,daemon=True);thread.start()
         def finish():
@@ -47,3 +64,5 @@ class Progress:
             self.say(f'Готово: {label} · {time.perf_counter()-started:.1f} с',phase=label,status='complete')
         finally:
             finish()
+            self.set_detail('')
+            _active.reset(token)

@@ -110,11 +110,12 @@ class FrozenEncoder:
         return cls(list(frame), cat, q.loc[.5].fillna(0).to_dict(), scales.to_dict())
 
     def native(self, frame):
-        f = frame.reindex(columns=self.columns).copy()
+        columns={}
         for c in self.columns:
-            f[c] = (f[c].fillna('__MISSING__').astype(str) if c in self.categories else
-                    pd.to_numeric(f[c], errors='coerce').replace([np.inf, -np.inf], np.nan))
-        return f
+            values=frame[c] if c in frame else pd.Series(np.nan,index=frame.index)
+            columns[c] = (values.fillna('__MISSING__').astype(str) if c in self.categories else
+                          pd.to_numeric(values, errors='coerce').replace([np.inf, -np.inf], np.nan))
+        return pd.DataFrame(columns,index=frame.index)
 
     def numeric(self, frame):
         f = self.native(frame)
