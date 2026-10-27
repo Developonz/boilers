@@ -274,7 +274,7 @@ function HealthRing({ score, trend, equipment }) {
       <div>
         <p className="metric-delta warning">{trend || 'Нет данных'}</p>
         <p className="metric-note">
-          Индекс здоровья {equipment || ''}: 100 — как в нормальной работе, ниже 50 — тревога
+          Соответствие ожидаемому режиму {equipment || ''}: 100 — близко к ожиданию, ниже 50 — превышение порога. Это не вероятность аварии и не остаточный ресурс.
         </p>
       </div>
     </div>
@@ -1786,6 +1786,11 @@ export default function App() {
   // --------------------------------------------------------------------------
   const overview = dashboard?.overview;
   const summary = dashboard?.summary;
+  const riskHours = [...new Set(Object.keys(summary?.interpretation || {}).flatMap(key => {
+    const match = /^risk_(\d+(?:\.\d+)?)h(?:_score)?$/.exec(key);
+    return match ? [Number(match[1])] : [];
+  }))].sort((a, b) => a - b);
+  const riskHorizonLabel = hours => hours === 24 ? 'суток' : hours === 168 ? 'недели' : `${hours} ч`;
   const dataRange = overview?.dataRange || fleet?.dataRange;
   const effectiveAsOf = (activeTab === 'fleet' ? fleet?.asOf : overview?.asOf) || dataRange?.end;
   const kpis = dashboard?.kpis || [];
@@ -2071,22 +2076,26 @@ export default function App() {
         </div>
       )}
 
-      {activeTab !== 'fleet' && summary?.modelRatio > 1 && summary?.interpretation && (
+      {activeTab !== 'fleet' && summary?.interpretation && (summary?.modelRatio > 1 || riskHours.some(h => Number.isFinite(summary.interpretation[`risk_${h}h_score`]) || Number.isFinite(summary.interpretation[`risk_${h}h`]))) && (
         <section className="alert-banner" aria-label="Интерпретация отклонения">
           <div>
             <strong>
               {summary.interpretation.label && summary.interpretation.label !== 'unknown'
                 ? (INTERPRETATION_LABELS[summary.interpretation.label] || summary.interpretation.label)
-                : 'Смысл отклонения пока не определён'}
+                : (summary.modelRatio > 1 ? 'Смысл отклонения пока не определён' : 'Оценка риска аварийного останова')}
             </strong>
             {summary.interpretation.label !== 'unknown' && Number.isFinite(summary.interpretation.confidence) && (
               <p>Уверенность оценки: {Math.round(summary.interpretation.confidence * 100)}%.</p>
             )}
-            {[24, 168].map((hours) => Number.isFinite(summary.interpretation[`risk_${hours}h`]) && (
+            {riskHours.map((hours) => Number.isFinite(summary.interpretation[`risk_${hours}h`]) && (
               <p key={hours}>
-                Оценка риска аварийного останова в течение {hours === 24 ? 'суток' : 'недели'}:{' '}
+                Оценка риска аварийного останова в течение {riskHorizonLabel(hours)}:{' '}
                 {Math.round(summary.interpretation[`risk_${hours}h`] * 100)}%.
+                {summary.interpretation[`risk_${hours}h_status`] !== 'calibrated_heldout_test' && ' Предварительная оценка на ограниченной истории.'}
               </p>
+            ))}
+            {riskHours.map(hours => !Number.isFinite(summary.interpretation[`risk_${hours}h`]) && Number.isFinite(summary.interpretation[`risk_${hours}h_score`]) && (
+              <p key={`score-${hours}`}>Модель риска: горизонт {hours} ч. Для оценки вероятности недостаточно независимой проверки.</p>
             ))}
           </div>
         </section>

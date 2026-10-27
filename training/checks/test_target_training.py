@@ -64,7 +64,8 @@ class TargetTrainingTests(unittest.TestCase):
             with initial_targets(tmp,'token'),patch.object(CatBoostRegressor,'fit',new=count):
                 NormalModel('CatBoost',cfg).fit_initial(x,changed)
             self.assertEqual(len(calls),2)
-            with self.assertRaisesRegex(ValueError,'incompatible'),initial_targets(tmp,'different-token'):pass
+            with initial_targets(tmp,'different-token'),patch.object(CatBoostRegressor,'fit',side_effect=AssertionError('Compatible targets refitted')):
+                NormalModel('CatBoost',cfg).fit_initial(x,y)
 
     def test_native_conversion_matches_previous_contract(self):
         x,_,_=sample();x['extra']=np.nan;x.loc[x.index[0],'load']=np.inf

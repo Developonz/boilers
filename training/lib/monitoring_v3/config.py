@@ -3,6 +3,8 @@ from copy import deepcopy
 from pathlib import Path
 import json
 import pandas as pd
+import math
+from numbers import Real
 
 
 DEFAULTS = dict(
@@ -21,6 +23,15 @@ DEFAULTS = dict(
     max_background_fraction=.05, pre_window_days=7, neutral_days=7, min_lead_hours=3,
     validation_tolerance=.25, validate_rows=168, validate_candidate=True, schema_version=1,
     scenarios=['local'], related_inputs={}, risk_horizons=[24, 168],
+    history_policy=dict(block_hours=168, calibration_every=3, validation_every=9,
+                        bootstrap=True, reference_days=60),
+    regime_policy=dict(stop_hours=2, off_fraction=.9, current_fraction=.15,
+                       current_thresholds={}, current_pairs={}, oil_channels=[],unknown_recovery_hours=None),
+    risk_policy=dict(scope='group', samples='episodes', sample_hours=6,
+                     min_positive_events=2, min_negative_groups=2,
+                     min_calibration_groups=2, confidence=.7),
+    critical_sensors=[],
+    event_overrides=[],
 )
 
 
@@ -30,6 +41,26 @@ def load(path=None, overrides=None):
         cfg.update(json.loads(Path(path).read_text(encoding='utf-8')))
     if overrides:
         cfg.update(overrides)
+    for key in ('history_policy','regime_policy','risk_policy'):
+        if not isinstance(cfg[key],dict):raise ValueError(key+' must be a dictionary')
+        extra=set(cfg[key])-set(DEFAULTS[key])
+        if extra:raise ValueError(f'Unknown {key} keys: {sorted(extra)}')
+        cfg[key]={**deepcopy(DEFAULTS[key]),**cfg[key]}
+    for key,default in DEFAULTS.items():
+        if type(default) in (int,float) and (isinstance(cfg[key],bool) or not isinstance(cfg[key],Real) or not math.isfinite(cfg[key])):
+            raise ValueError(key+' must be a finite number')
+    for policy in ('history_policy','regime_policy','risk_policy'):
+        for key,default in DEFAULTS[policy].items():
+            value=cfg[policy][key]
+            if type(default) in (int,float) and (isinstance(value,bool) or not isinstance(value,Real) or not math.isfinite(value)):
+                raise ValueError(policy+'.'+key+' must be a finite number')
+    for key in ('horizons','risk_horizons','alarm_budgets'):
+        if not isinstance(cfg[key],list) or not cfg[key] or any(isinstance(v,bool) or not isinstance(v,Real) or not math.isfinite(v) or v<=0 for v in cfg[key]):
+            raise ValueError(key+' must contain positive finite numbers')
+    if not isinstance(cfg['run_thresholds'],dict) or any(isinstance(v,bool) or not isinstance(v,Real) or not math.isfinite(v) or v<0 for v in cfg['run_thresholds'].values() if v is not None):
+        raise ValueError('run_thresholds must contain finite nonnegative numbers')
+    first=pd.Timestamp(cfg['first_test'])
+    if pd.isna(first) or first.tz is not None:raise ValueError('first_test must be a valid local timestamp without timezone')
     cfg['alarm_budgets']=[float(b) for b in cfg['alarm_budgets']]
     cfg['alarm_budget']=float(cfg['alarm_budget'])
     unknown = set(cfg) - set(DEFAULTS)
@@ -55,11 +86,18 @@ def load(path=None, overrides=None):
         raise ValueError('Invalid threshold/background fractions')
     for key in ('min_train_rows', 'calibration_rows', 'min_sensor_rows', 'memory_rows',
                 'calibration_limit', 'cb_initial_trees', 'cb_update_trees', 'cb_max_trees',
-                'threads', 'persist_hours', 'validate_rows'):
+                'threads', 'persist_hours', 'validate_rows','replay_rows','update_rows','neighbors'):
         if cfg[key] <= 0:
             raise ValueError(f'{key} must be positive')
     if not 0 < cfg['minimum_coverage'] <= 1:
         raise ValueError('minimum_coverage must be in (0, 1]')
+    if cfg['cb_max_trees']<cfg['cb_initial_trees']:raise ValueError('cb_max_trees must cover the initial trees')
+    for key in ('min_train_rows','calibration_rows','min_sensor_rows','memory_rows','replay_rows','update_rows',
+                'calibration_limit','validate_rows','cb_initial_trees','cb_update_trees','cb_max_trees','cb_depth','threads','neighbors'):
+        if isinstance(cfg[key],bool) or not isinstance(cfg[key],(int,float)) or int(cfg[key])!=cfg[key] or cfg[key]<=0:
+            raise ValueError(key+' must be a positive integer')
+        cfg[key]=int(cfg[key])
+    if not 0<cfg['learning_rate']<=1:raise ValueError('learning_rate must be in (0, 1]')
     if cfg['admission_delay_days'] < cfg['pre_window_days']:
         raise ValueError('Admission delay must cover the failure prediction horizon')
     if not set(cfg['models']) <= {'analogs', 'AAKR', 'MSET', 'CatBoost', 'HistGradientBoosting', 'CatBoostCorrection', 'CatBoostMulti'}:
@@ -70,4 +108,37 @@ def load(path=None, overrides=None):
         raise ValueError('Unsupported scenario')
     if cfg['alarm_budget'] not in cfg['alarm_budgets'] or any(x <= 0 for x in cfg['alarm_budgets']):
         raise ValueError('alarm_budget must be one of the positive alarm_budgets')
+    if any(not pd.notna(h) or h<=0 for h in cfg['risk_horizons']) or not cfg['risk_horizons']:
+        raise ValueError('risk_horizons must contain positive hours')
+    cfg['risk_horizons']=[int(h) if float(h).is_integer() else float(h) for h in cfg['risk_horizons']]
+    hp,rp,ip=cfg['history_policy'],cfg['regime_policy'],cfg['risk_policy']
+    if hp['block_hours']<=0 or hp['calibration_every']<2 or hp['validation_every']<3 or hp['reference_days']<=0:
+        raise ValueError('Invalid history_policy')
+    for key in ('calibration_every','validation_every'):
+        if isinstance(hp[key],bool) or int(hp[key])!=hp[key]:raise ValueError('history_policy.'+key+' must be an integer')
+        hp[key]=int(hp[key])
+    if not isinstance(hp['bootstrap'],bool):raise ValueError('history_policy.bootstrap must be True or False')
+    if rp['stop_hours']<=0 or not 0<rp['off_fraction']<=1 or not 0<rp['current_fraction']<1:
+        raise ValueError('Invalid regime_policy')
+    if rp['unknown_recovery_hours'] is not None and (isinstance(rp['unknown_recovery_hours'],bool) or not isinstance(rp['unknown_recovery_hours'],Real) or not math.isfinite(rp['unknown_recovery_hours'])):
+        raise ValueError('unknown_recovery_hours must be a finite number or None')
+    if rp['unknown_recovery_hours'] is not None and rp['unknown_recovery_hours']<0:raise ValueError('unknown_recovery_hours must be nonnegative or None')
+    if not isinstance(rp['current_thresholds'],dict) or not isinstance(rp['current_pairs'],dict):raise ValueError('Current settings must be dictionaries')
+    if cfg['calibration_limit']<max(cfg['calibration_rows'],cfg['min_sensor_rows']):raise ValueError('calibration_limit must cover calibration_rows and min_sensor_rows')
+    if ip['scope'] not in ('group','unit') or ip['samples'] not in ('episodes','continuous'):
+        raise ValueError('Invalid risk scope/samples')
+    if pd.Timedelta(hours=ip['sample_hours'])%step!=pd.Timedelta(0) or pd.Timedelta(hours=hp['block_hours'])%step!=pd.Timedelta(0):
+        raise ValueError('Sampling/block durations must be multiples of step')
+    if any(ip[k]<=0 for k in ('sample_hours','min_positive_events','min_negative_groups','min_calibration_groups')) or not 0<ip['confidence']<1:
+        raise ValueError('Invalid risk_policy')
+    for key in ('min_positive_events','min_negative_groups','min_calibration_groups'):
+        if isinstance(ip[key],bool) or int(ip[key])!=ip[key]:raise ValueError('risk_policy.'+key+' must be an integer')
+        ip[key]=int(ip[key])
+    if cfg['min_lead_hours']<0 or cfg['validation_tolerance']<0 or cfg['smooth_hours']<=0 or cfg['slow_hours']<=0:
+        raise ValueError('Lead/tolerance must be nonnegative; smoothing windows must be positive')
+    if any(h<=cfg['min_lead_hours'] for h in cfg['risk_horizons']):
+        raise ValueError('Risk horizons must exceed min_lead_hours')
+    for event in cfg['event_overrides']:
+        if not {'unit','stop','type','label_available_at'}<=set(event) or event['type'] not in ('Авария','План','Резерв','Неизвестно'):
+            raise ValueError('event_overrides require unit, stop, type and label_available_at')
     return cfg

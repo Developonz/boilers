@@ -4,7 +4,7 @@
 
 Цепочка расчёта на выбранный момент «at»:
   1. часовая таблица (hourly.parquet от opc_to_wide.py) — история модели до at включительно;
-  2. очистка, как в ноутбуке 02 (раздел 2): залипшие значения и одиночные скачки -> пропуски;
+  2. единая с ноутбуком очистка: подозрения сохраняются; маскирование только по правилам канала;
   3. модель из папки k2_deploy (model.py этой папки) -> r = model.score(история);
   4. на момент at: режим котла, отношение к порогу выбранного вида, тревога, индекс здоровья, а по каждому
      датчику — ожидание и коридор нормы для текущего режима, отклонение («ошибка / обычная ошибка») и уровень.
@@ -88,7 +88,7 @@ def resolve_hourly_path(base_dir: Path, configured: str) -> Path:
     return found[0] if found else default
 
 
-def read_hourly(path: Path, numeric_columns=None) -> Tuple[pd.DataFrame, List[str], List[str]]:
+def read_hourly(path: Path, numeric_columns=None, normalizer=None) -> Tuple[pd.DataFrame, List[str], List[str]]:
     """Часовая таблица: время в индексе (сетка 1 ч), только сами датчики (без __min/__max/…, служебных и меток)."""
     import pyarrow.parquet as pq
 
@@ -99,6 +99,10 @@ def read_hourly(path: Path, numeric_columns=None) -> Tuple[pd.DataFrame, List[st
             if c == TIME_COL or not (FEATURE_RX.search(c) or c.startswith('_') or c in LABEL_COLS)]
     df = pd.read_parquet(path, columns=cols)
     df.columns = [str(c).strip() for c in df.columns]        # пробелы в конце имён — как при обучении (k2_lib их обрезает)
+    if normalizer is not None:
+        df=normalizer(df)
+        numeric=[c for c in df if pd.api.types.is_numeric_dtype(df[c])]
+        return df,numeric,[c for c in df if c not in numeric]
     df = df.loc[:, ~df.columns.duplicated()]
     stamps = pd.to_datetime(df.pop(TIME_COL), errors='coerce')
     df.index = pd.DatetimeIndex(stamps).round('1h')
@@ -265,11 +269,11 @@ class LegacyAdapter:
 
             core._inputs = observed_inputs
 
-    def score(self, raw):
+    def score(self, raw,**kwargs):
         captured = {}
         token = self._input_capture.set(captured) if self._input_capture else None
         try:
-            result = self.core.score(raw)
+            result = self.core.score(raw,**kwargs)
         finally:
             if self._input_capture:
                 self._input_capture.reset(token)
@@ -478,7 +482,9 @@ class K2Service:
                 try:
                     lm = self._model
                     columns = (set(lm.scaler_num) | {lm.run_col} | set(lm.mills)) if lm else None
-                    self._data = read_hourly(path, numeric_columns=columns)
+                    core=lm.model.core if lm and isinstance(lm.model,LegacyAdapter) else lm.model if lm else None
+                    normalizer=getattr(core,'normalize_input',None) if lm and lm.cfg.get('core')=='incremental' else None
+                    self._data = read_hourly(path, numeric_columns=columns,normalizer=normalizer)
                     if self._data[0].empty:
                         raise DataUnavailable(f'В {path} нет часовых данных.')
                 except DataUnavailable:
@@ -532,7 +538,8 @@ class K2Service:
         Итоговая модель «помнит» часы, на которых училась, и в прошлом показывала бы их как норму."""
         lm = self.model()
         until = lm.trained_until
-        if until is not None and at > until:
+        available=lm.cfg.get('available_at')
+        if (available and at>=pd.Timestamp(available)) or (not available and until is not None and at>until):
             return lm
         path = self.months().get(at.to_period('M'))
         if path is None:
@@ -666,11 +673,14 @@ class K2Service:
         else:
             clean, frozen_now = self._clean(sl, numeric)
         hist = df.loc[h0:at]
-        model_in = clean.loc[h0:at]
+        incremental=cfg.get('core')=='incremental'
+        # Preparation needs the complete causal prefix; the runtime bounds costly
+        # predictions to the requested display period plus rolling warmup.
+        model_in = df.loc[:at] if incremental else clean.loc[h0:at]
         counters = cache_counters(lm.model)
         score_start = time.perf_counter()
         try:
-            r = lm.model.score(model_in)
+            r = lm.model.score(model_in,period_start=h0) if incremental else lm.model.score(model_in)
         except Exception as exc:  # noqa: BLE001 — сообщение модели показываем как есть
             raise DataUnavailable(f'Не удалось посчитать момент {at:%d.%m.%Y %H:%M}: {exc}') from exc
         after = cache_counters(lm.model)
@@ -708,10 +718,21 @@ class K2Service:
             else:
                 valid = model_in.reindex(index=M.index, columns=checked).notna()
             errors = M[checked].astype(float).where(valid)
-            errors_smooth = errors.rolling(f'{int(cfg.get("smooth_steps", 6))}h', min_periods=1).mean()
+            if incremental:
+                contiguous=errors.index.to_series().diff().eq(pd.Timedelta(cfg.get('step','1h')))
+                smoothed={}
+                for column in errors:
+                    valid_column=errors[column].notna()
+                    segments=(~valid_column|~valid_column.shift(fill_value=False)|~contiguous).cumsum()
+                    smoothed[column]=errors[column].groupby(segments).transform(
+                        lambda values:values.rolling(pd.Timedelta(hours=float(cfg.get('smooth_steps',6))),min_periods=1).mean()).where(valid_column)
+                errors_smooth=pd.DataFrame(smoothed,index=errors.index)
+            else:errors_smooth = errors.rolling(f'{int(cfg.get("smooth_steps", 6))}h', min_periods=1).mean()
 
         scored_now = errors is not None and at in errors.index
-        if mode_now == M_STOP:
+        if cfg.get('normal_history_status')=='unsafe_retracted':
+            not_scored='обучающая норма пересмотрена; оценки недоступны до восстановления модели'
+        elif mode_now == M_STOP:
             not_scored = 'котёл стоит'
         elif mode_now == M_START:
             not_scored = f'пуск котла (первые {cfg.get("startup_steps", "")} ч после включения)'
@@ -813,6 +834,12 @@ class K2Service:
             'topSensors': int(view.get('top', 1)),
             'threshold': _finite(view.get('thr')),
             'trainedUntil': cfg.get('trained_until'),
+            'availableAt':cfg.get('available_at'),
+            'calibrationStart':cfg.get('calibration_start'),
+            'calibrationEnd':cfg.get('calibration_end'),
+            'normalHistoryStatus':cfg.get('normal_history_status','ready'),
+            'operatingThresholdSource':cfg.get('operating_threshold_source'),
+            'interpretationHeads':cfg.get('interpretation_heads',[]),
             'created': cfg.get('created'),
             'smoothHours': cfg.get('smooth_steps'),
             'persistHours': cfg.get('persist_steps'),

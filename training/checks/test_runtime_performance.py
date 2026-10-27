@@ -125,7 +125,9 @@ class RuntimePerformanceTests(unittest.TestCase):
         for budget in cfg['alarm_budgets']:
             actual=calibrate_threshold(score,cfg,budget)
             expected=scalar_calibration(score,cfg,budget)
-            self.assertEqual(actual,expected)
+            self.assertEqual({key:actual[key] for key in expected},expected)
+            self.assertGreaterEqual(actual['rate_high'],actual['alarm_rate'])
+            self.assertAlmostEqual(actual['rate_resolution'],720/actual['hours'])
 
     def test_wide_mapping_and_forecast_do_not_fragment_frames(self):
         from monitoring_v3.preparation import conditions,regimes
@@ -140,7 +142,7 @@ class RuntimePerformanceTests(unittest.TestCase):
             cfg=load();regime=regimes(frame.s0,20,cfg)
             features=conditions(frame,roles,regime,'К-1')
             targets=[c for c,r in roles.items() if r=='target']
-            context=dict(features=features,cleaned=frame,targets=targets,eligible=regime.eligible,
+            context=dict(load='s0',features=features,cleaned=frame,targets=targets,eligible=regime.eligible,
                          changes=pd.DataFrame({c+'::held_hours':0. for c in targets},index=ix))
             dataset(context,'forecast',6,cfg)
         self.assertEqual(len(frame.columns),222)

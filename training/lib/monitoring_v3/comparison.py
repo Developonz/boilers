@@ -15,9 +15,11 @@ def common_comparison(root, contexts, cfg):
             directory=p.parent/unit
             if not directory.exists():
                 continue
-            family=(spec['group'],spec['scenario'],'+'.join(spec['sources']),unit)
             for b in cfg['alarm_budgets']:
                 for path in directory.glob('*__'+str(b)+'.parquet'):
+                    # Compare like-for-like schemes. Missing rare-event evidence
+                    # must not erase the continuous detectors' comparison period.
+                    family=(spec['group'],spec['scenario'],'+'.join(spec['sources']),unit,path.stem.rsplit('__',1)[0],b)
                     families.setdefault(family,[]).append((p.parent.name,path,b))
     rows=[]
     for family,items in families.items():
@@ -27,10 +29,10 @@ def common_comparison(root, contexts, cfg):
         for name,path,b in items:
             d=frames[str(path)].copy()
             d.loc[~shared.reindex(d.index).fillna(False),'score']=np.nan
-            summary,events=evaluate(d,contexts[family[-1]]['events'],cfg,start=cfg['first_test'])
+            summary,events=evaluate(d,contexts[family[3]]['events'],cfg,start=cfg['first_test'])
             # Keep the original notification stream; no new notices at mask boundaries.
             ci=event_bootstrap(events)
-            valid=d.score.notna() & np.isfinite(d.ratio)
+            valid=d.score.notna() & np.isfinite(d.ratio) & (d.index>=pd.Timestamp(cfg['first_test']))
             hourly=pd.DataFrame(dict(active=d.active.where(valid),notification=d.notification.where(valid),valid=valid.astype(int)))
             blocks=hourly.resample('7D').agg(dict(active='sum',notification='sum',valid='sum'))
             blocks=blocks.loc[blocks.valid.gt(0)]

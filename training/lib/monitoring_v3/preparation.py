@@ -6,6 +6,15 @@ import pandas as pd
 STOP, START, RUN, UNKNOWN = 'стоит', 'пуск', 'работа', 'неизвестно'
 
 
+def categorical_values(values):
+    """Numeric state 1 must not turn into a new category '1.0' after a gap."""
+    def text(value):
+        if pd.isna(value):return '__MISSING__'
+        if isinstance(value,(float,np.floating)) and np.isfinite(value) and float(value).is_integer():return str(int(value))
+        return str(value)
+    return values.astype(object).map(text)
+
+
 def run_threshold(load, state, before, fraction=.25):
     ref = pd.to_numeric(load, errors='coerce').where(load.index < pd.Timestamp(before))
     if state is not None:
@@ -16,22 +25,70 @@ def run_threshold(load, state, before, fraction=.25):
     return float(ref.median() * fraction)
 
 
-def regimes(load, threshold, cfg):
+def regimes(load, threshold, cfg, evidence=None):
     step = pd.Timedelta(cfg['step'])
     x = pd.to_numeric(load, errors='coerce').replace([np.inf, -np.inf], np.nan)
     last = pd.Series(x.index.where(x.notna()), index=x.index).ffill()
     age = (x.index.to_series() - last).dt.total_seconds() / 3600
     held = x.ffill().where(age.le(cfg['load_hold_hours']))
-    on = held.gt(threshold)
-    unknown = held.isna()
-    segment = (on.ne(on.shift()) | unknown | unknown.shift(fill_value=True)).cumsum()
-    since = segment.groupby(segment).cumcount() * step / pd.Timedelta('1h')
-    mode = pd.Series(STOP, index=x.index, dtype=object)
-    mode.loc[on] = RUN
-    mode.loc[on & since.lt(cfg['startup_hours'])] = START
-    mode.loc[unknown] = UNKNOWN
-    return pd.DataFrame(dict(mode=mode, load_missing=x.isna(), load_age_hours=age,
-                             since_start_hours=since.where(on), eligible=mode.eq(RUN)), index=x.index)
+    policy=cfg.get('regime_policy',{})
+    off=threshold*policy.get('off_fraction',.9)
+    required=max(1,int(np.ceil(pd.Timedelta(hours=policy.get('stop_hours',2))/step)))
+    modes=[];ages=[];stops=[];stop_times=[];conflicts=[];known_ages=[];observed_ages=[];recoveries=[]
+    running=False;started=None;low_start=None;low_count=0;ever_on=False
+    age_known=True;recovering=False;recovery_start=None
+    recovery_hours=policy.get('unknown_recovery_hours')
+    if recovery_hours is None:recovery_hours=cfg['startup_hours']
+    coal=evidence.coal_evidence.reindex(x.index) if evidence is not None else pd.Series(np.nan,index=x.index)
+    for t,v,c,observed_value in zip(x.index,held.to_numpy(),coal.to_numpy(),x.to_numpy()):
+        conflict=bool(np.isfinite(v) and v<=off and c==1)
+        confirmed=False;stop_at=pd.NaT
+        if not np.isfinite(v) or conflict:
+            mode=UNKNOWN;age_run=np.nan;low_count=0;low_start=None
+            if running:age_known=False;recovering=True;recovery_start=None
+            # Unknown data are not evidence of either shutdown or a fresh start.
+        elif v>threshold or (running and v>off):
+            if not running:started=t;age_known=True;recovering=False;recovery_start=None
+            running=True;ever_on=True;low_count=0;low_start=None
+            age_run=float((t-started)/pd.Timedelta('1h')) if age_known else np.nan
+            if recovering:
+                if recovery_start is None:recovery_start=t
+                recovering=(t-recovery_start)<pd.Timedelta(hours=recovery_hours)
+                mode=UNKNOWN if recovering else RUN
+            else:mode=START if age_known and age_run<cfg['startup_hours'] else RUN
+        else:
+            if not np.isfinite(observed_value):
+                # Holding the last low sample is not a second measurement that
+                # confirms a physical stop. A missing sample breaks confirmation.
+                modes.append(UNKNOWN if running else STOP);ages.append(np.nan)
+                stops.append(False);stop_times.append(pd.NaT);conflicts.append(conflict)
+                if running:age_known=False;recovering=True;recovery_start=None
+                known_ages.append(age_known);observed_ages.append(np.nan);recoveries.append(recovering)
+                low_count=0;low_start=None
+                continue
+            low_start=t if low_count==0 else low_start;low_count+=1;age_run=np.nan
+            if low_count>=required:
+                confirmed=bool(running and ever_on);stop_at=low_start if confirmed else pd.NaT
+                running=False;started=None;mode=STOP;age_known=True;recovering=False;recovery_start=None
+            else:mode=UNKNOWN if running else STOP
+        modes.append(mode);ages.append(age_run);stops.append(confirmed);stop_times.append(stop_at);conflicts.append(conflict)
+        known_ages.append(age_known)
+        observed_ages.append(float((t-recovery_start)/pd.Timedelta('1h')) if recovery_start is not None and mode!=STOP else age_run)
+        recoveries.append(recovering)
+    result=pd.DataFrame(dict(mode=modes,load_missing=x.isna(),load_age_hours=age,
+        since_start_hours=ages,stop_confirmed=stops,physical_stop_at=pd.Series(stop_times,index=x.index,dtype='datetime64[ns]'),
+        evidence_conflict=conflicts,run_age_known=known_ages,observed_run_hours=observed_ages,
+        recovering_after_unknown=recoveries),index=x.index)
+    result['eligible']=result['mode'].eq(RUN)
+    if evidence is not None:result=pd.concat([result,evidence.add_prefix('evidence::')],axis=1)
+    last=pd.Series(pd.NaT,index=x.index,dtype='datetime64[ns]')
+    last.loc[result.stop_confirmed]=result.loc[result.stop_confirmed,'physical_stop_at']
+    result['since_stop_hours']=(x.index.to_series()-last.ffill()).dt.total_seconds()/3600
+    result['regime_status']=np.where(result.evidence_conflict,'load_current_conflict',
+        np.where(result.recovering_after_unknown,'recovering_after_unknown',
+        np.where(result['mode'].eq(UNKNOWN)&coal.eq(1),'probable_coal_operation',
+        np.where(result['mode'].eq(UNKNOWN),'insufficient_evidence',np.where(~result.run_age_known,'run_age_unknown','load_confirmed')))))
+    return result
 
 
 def clean(frame, targets, rules, step='1h'):
@@ -88,8 +145,14 @@ def conditions(frame, roles, regime, unit, step='1h'):
         value = frame[c].astype(object)
         group = value.ne(value.shift()).cumsum()
         columns[c+'::held_hours'] = value.groupby(group).cumcount() * pd.Timedelta(step)/pd.Timedelta('1h')
-        columns[c] = value.fillna('__MISSING__').astype(str)
-    return pd.DataFrame(columns,index=frame.index)
+        columns[c] = categorical_values(value)
+    for c in regime:
+        if c.startswith('evidence::') or c in ('since_stop_hours','evidence_conflict','regime_status','run_age_known','observed_run_hours','recovering_after_unknown'):
+            columns['regime::'+c]=regime[c]
+    result=pd.DataFrame(columns,index=frame.index)
+    result.attrs['load_column']=next((c for c,r in roles.items() if r=='load'),None)
+    result.attrs['condition_columns']=[c for c,r in roles.items() if r=='condition']
+    return result
 
 
 @dataclass

@@ -1,5 +1,10 @@
 {
   "defaults": {"kind": "unreviewed", "mask_frozen": false, "mask_spikes": false},
-  "sensors": {},
+  "sensors": {
+    "стартовый небаланс при включении в параллель": {
+      "kind": "rare", "mask_frozen": false, "mask_spikes": false,
+      "group": "Пусковые события"
+    }
+  },
   "note": "Keys are canonical common channel names from sensor_audit.csv. Assign kind continuous/discrete/rare and group only after reviewing real channel meaning. Unreviewed channels retain values and quality flags."
 }

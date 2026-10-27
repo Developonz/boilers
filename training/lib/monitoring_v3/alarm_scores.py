@@ -5,6 +5,11 @@ import pandas as pd
 from sklearn.metrics import average_precision_score
 
 
+def view_policy(cfg,view):
+    return dict(cfg,persist_hours=float(pd.Timedelta(cfg['step'])/pd.Timedelta('1h')),
+                merge_hours=0) if view.endswith('::event') else cfg
+
+
 def sensor_scale(errors):
     q = errors.abs().quantile(.99)
     positive = q[q.gt(1e-9)]
@@ -13,24 +18,27 @@ def sensor_scale(errors):
     return q.where(q.gt(1e-9), 1.).clip(lower=max(floor, 1e-6))
 
 
-def score_views(errors, scale, cfg, groups=None):
+def score_views(errors, scale, cfg, groups=None, event_sensors=(),event_changes=None):
     """Only target columns with real estimates take part in numerator AND denominator."""
     groups = groups or {}
     normalized = errors.div(scale.reindex(errors.columns), axis=1)
+    rare=[c for c in event_sensors if c in normalized]
+    continuous=normalized.drop(columns=rare)
     outputs, matrices = {}, {}
     step = pd.Timedelta(cfg['step'])
+    contiguous=errors.index.to_series().diff().eq(step)
     for temporal, hours in [('instant', 0), ('slow48', cfg['slow_hours'])]:
-        e = normalized
+        e = continuous
         if hours:
             # Do not carry evidence across a stop, unknown load or a gap in scoring.
             valid_row = e.notna().any(axis=1)
-            seg = (~valid_row | ~valid_row.shift(fill_value=False)).cumsum()
+            seg = (~valid_row | ~valid_row.shift(fill_value=False) | ~contiguous).cumsum()
             minimum = max(1, int(math.ceil(hours*pd.Timedelta('1h')/step/2)))
             e = e.groupby(seg).transform(lambda x: x.rolling(f'{hours}h', min_periods=minimum).mean()).where(e.notna())
         a = e.abs()
-        coverage = a.notna().mean(axis=1)
+        coverage = a.notna().mean(axis=1) if len(a.columns) else pd.Series(0.,index=a.index)
         good = coverage.ge(cfg['minimum_coverage'])
-        out = dict(max=a.max(axis=1), mean=a.mean(axis=1), fraction=a.gt(1).where(a.notna()).mean(axis=1))
+        out = dict(max=a.max(axis=1), mean=a.mean(axis=1), fraction=a.gt(1).astype(float).where(a.notna()).mean(axis=1))
         # Select the same descending top five without constructing a Series for
         # every timestamp. Missing channels stay out of the denominator.
         values=a.to_numpy(dtype=float,na_value=np.nan)
@@ -42,15 +50,24 @@ def score_views(errors, scale, cfg, groups=None):
         out['top5']=pd.Series(np.divide(total,count,out=np.full(len(a),np.nan),where=count>0),index=a.index)
         for group in sorted(set(groups.values()) - {''}):
             cols = [c for c in a if groups.get(c) == group]
+            if not cols:continue
             out['group:'+group] = a[cols].mean(axis=1).where(a[cols].notna().mean(axis=1).ge(cfg['minimum_coverage']))
         for name, s in out.items():
             key = name+'::'+temporal
-            valid = good & s.notna()
-            segments = (~valid | ~valid.shift(fill_value=False)).cumsum()
+            cols=[c for c in a if groups.get(c)==name[len('group:'):]] if name.startswith('group:') else list(a)
+            local_coverage=a[cols].notna().mean(axis=1) if cols else pd.Series(0.,index=a.index)
+            valid = local_coverage.ge(cfg['minimum_coverage']) & s.notna()
+            segments = (~valid | ~valid.shift(fill_value=False) | ~contiguous).cumsum()
             smooth = s.where(valid).groupby(segments).transform(
                 lambda x: x.rolling(f"{cfg['smooth_hours']}h", min_periods=1).mean())
-            outputs[key] = pd.DataFrame(dict(score=s.where(valid), smoothed=smooth.where(valid), coverage=coverage))
-            matrices[key] = a.where(good)
+            outputs[key] = pd.DataFrame(dict(score=s.where(valid), smoothed=smooth.where(valid), coverage=local_coverage))
+            matrices[key] = a[cols].where(valid)
+    if rare:
+        available=normalized[rare].notna()
+        changes=event_changes.reindex(index=errors.index,columns=rare).astype(float).where(available) if event_changes is not None else pd.DataFrame(np.nan,index=errors.index,columns=rare)
+        score=changes.sum(axis=1,min_count=1)
+        outputs['rare_changes::event']=pd.DataFrame(dict(score=score,smoothed=score,coverage=available.mean(axis=1)))
+        matrices['rare_changes::event']=changes
     return outputs, matrices
 
 
@@ -112,8 +129,14 @@ def calibrate_threshold(score, cfg, budget=None):
         rate = np.count_nonzero(notices)*720/hours
         fraction = float(np.sum(ends-confirmed)/valid.sum())
         if rate <= budget and fraction <= cfg['max_background_fraction']:
+            from scipy.stats import chi2
+            count=int(np.count_nonzero(notices))
             return dict(threshold=float(threshold), hours=float(hours), status='calibrated',
-                        alarm_rate=float(rate), alarm_fraction=fraction, budget=float(budget))
+                        alarm_rate=float(rate), alarm_fraction=fraction, budget=float(budget),
+                        rate_resolution=float(720/hours),
+                        evidence='limited' if hours<max(720,720/budget) else 'multi_month',
+                        rate_low=float(.5*chi2.ppf(.025,2*count)*720/hours) if count else 0.,
+                        rate_high=float(.5*chi2.ppf(.975,2*(count+1))*720/hours))
     raise AssertionError('Upper threshold must yield no alarms')
 
 
@@ -125,7 +148,10 @@ def evaluate(timeline, events, cfg, start=None, end=None):
     positive = pd.Series(False, index=ix)
     background = pd.Series(True, index=ix)
     leads, details = [], []
+    uncertain=pd.Series(False,index=ix)
     for e in events.itertuples():
+        if e.type=='Неизвестно' and pd.notna(e.stop):
+            uncertain|=(ix>=e.stop-pd.Timedelta(days=cfg['pre_window_days']))&(ix<e.stop)
         if e.type != 'Авария' or pd.isna(e.stop):
             continue
         left = e.stop-pd.Timedelta(days=cfg['pre_window_days'])
@@ -142,9 +168,11 @@ def evaluate(timeline, events, cfg, start=None, end=None):
         if caught:
             leads.append(lead)
         details.append(dict(stop=e.stop, detected=caught, ongoing_alarm=ongoing and not caught,
+                            event_id=e.event_id if hasattr(e,'event_id') else str(e.stop),
+                            observable=bool((window&valid).any()),
                             lead_hours=lead, observed_hours=float((window & valid).sum()*step/pd.Timedelta('1h')),
                             possible_hours=float(np.sum(window & (ix >= start) & (ix < end))*step/pd.Timedelta('1h'))))
-    background &= valid & timeline.get('background_eligible', pd.Series(True,index=ix)).fillna(False)
+    background &= valid & ~uncertain & timeline.get('background_eligible', pd.Series(True,index=ix)).fillna(False)
     used = (positive | background) & valid
     labels = positive[used].astype(int)
     finite_ratio = timeline.ratio[used].replace([np.inf, -np.inf], np.nan)
@@ -153,6 +181,13 @@ def evaluate(timeline, events, cfg, start=None, end=None):
     hours = float(background.sum()*step/pd.Timedelta('1h'))
     caught = sum(x['detected'] for x in details)
     summary = dict(events=len(details), detected=caught, recall=caught/len(details) if details else np.nan,
+                   unanchored_events=int(((events.type=='Авария')&events.stop.isna()&events.start.ge(start)&events.start.lt(end)).sum()) if 'start' in events else 0,
+                   observable_events=sum(x['observable'] for x in details),
+                   unobserved_events=sum(not x['observable'] for x in details),
+                   recall_observed=(sum(x['detected'] for x in details if x['observable'])/sum(x['observable'] for x in details)
+                                    if any(x['observable'] for x in details) else np.nan),
+                   uncertain_hours=float((uncertain&valid).sum()*step/pd.Timedelta('1h')),
+                   uncertain_notifications=int((uncertain&valid&timeline.notification).sum()),
                    ongoing_events=sum(x['ongoing_alarm'] for x in details),
                    background_hours=hours, background_notifications=int((timeline.notification & background).sum()),
                    alarms_per_720h=float((timeline.notification & background).sum()*720/hours) if hours else np.nan,
@@ -161,4 +196,9 @@ def evaluate(timeline, events, cfg, start=None, end=None):
                    random_precision=float(labels[known].mean()) if known.any() else np.nan,
                    calculated_hours=float(valid.sum()*step/pd.Timedelta('1h')),
                    unscored_hours=float(((ix >= start) & (ix < end) & ~valid).sum()*step/pd.Timedelta('1h')))
+    period=(ix>=start)&(ix<end)
+    eligible=timeline.get('eligible',pd.Series(True,index=ix)).eq(True)&period
+    summary['working_unscored_hours']=float((eligible&~valid).sum()*step/pd.Timedelta('1h'))
+    summary['non_working_hours']=float((period&~eligible).sum()*step/pd.Timedelta('1h'))
+    summary['availability_operating']=float((eligible&valid).sum()/eligible.sum()) if eligible.any() else np.nan
     return summary, pd.DataFrame(details)

@@ -66,6 +66,7 @@ def ensemble_features(root, unit):
     for path in sorted(root.glob('experiments/*/'+unit+'/interpretation_features.parquet')):
         frame=pd.read_parquet(path)
         selected=frame.select_dtypes(include='number')
+        if 'features_valid' in frame:selected=selected.where(frame.features_valid.eq(True),axis=0)
         selected=selected.add_prefix(path.parent.parent.name+'::')
         parts.append(selected)
     if not parts:
@@ -73,9 +74,10 @@ def ensemble_features(root, unit):
     return pd.concat(parts,axis=1)
 
 
-def survival_landmarks(features, events, observed_end, as_of):
+def survival_landmarks(features, events, observed_end, as_of,observed=None):
     rows=[]
-    known=events.loc[events.label_available_at.le(as_of)].sort_values('stop')
+    known=events.loc[events.stop.notna()&events.stop.le(as_of)].sort_values('stop')
+    if 'stop_detected_at' in known:known=known.loc[known.stop_detected_at.isna()|known.stop_detected_at.le(as_of)]
     for t in features.index:
         end=min(pd.Timestamp(observed_end),pd.Timestamp(as_of))
         if end <= t:
@@ -83,26 +85,38 @@ def survival_landmarks(features, events, observed_end, as_of):
         next_events=known.loc[known.stop.gt(t)&known.stop.le(end)]
         e=next_events.iloc[0] if len(next_events) else None
         stop=e.stop if e is not None else end
+        if observed is not None:
+            missing=observed.index[(observed.index>t)&(observed.index<stop)&~observed.fillna(False).astype(bool)]
+            if len(missing):stop=missing[0];e=None
+        documents=events.loc[events.stop.isna()&events.start.gt(t)&events.start.lt(stop)&events.label_available_at.le(as_of)] if 'start' in events else events.iloc[:0]
+        if len(documents):stop=documents.start.min();e=None
         duration=float((stop-t)/pd.Timedelta('1h'))
-        failure=e is not None and e.type=='Авария'
+        from .event_registry import event_type_at
+        kind,available=event_type_at(e,as_of) if e is not None else ('Неизвестно',pd.NaT)
+        failure=e is not None and kind=='Авария'
+        detected=getattr(e,'stop_detected_at',pd.NaT) if e is not None else pd.NaT
+        available=max(stop,pd.Timestamp(available)) if failure and pd.notna(available) else stop
+        if pd.notna(detected):available=max(available,pd.Timestamp(detected))
         rows.append(dict(time=t,duration_hours=duration,event=failure,
-                         cohort=e.event_id if e is not None else 'right_censored',
+                         cohort=e.event_id if e is not None else 'censored::'+str(stop),label_available_at=available,
                          label=duration if failure else -duration))
     return pd.DataFrame(rows).set_index('time') if rows else pd.DataFrame()
 
 
-def survival_experiment(features, events, cfg, as_of, observed_end, dest):
+def survival_experiment(features, events, cfg, as_of, observed_end, dest,observed=None):
     from catboost import CatBoostRegressor
     from .preparation import FrozenEncoder
     import joblib
     dest=Path(dest);dest.mkdir(parents=True,exist_ok=True)
     # Weekly landmarks avoid treating every hour as a separate life.
-    f=features.resample('7D').first().dropna(how='all')
-    labels=survival_landmarks(f,events,observed_end,as_of)
+    # Take one real row, never the first non-null value of each different hour.
+    f=features.sort_index().groupby(pd.Grouper(freq='7D'),group_keys=False).head(1).dropna(how='all')
+    f=f.drop(columns=['episode_group','episode_sample_due'],errors='ignore')
+    labels=survival_landmarks(f,events,observed_end,as_of,observed)
     status=dict(status='insufficient_independent_events',assumption='planned stops are censored; censoring may be informative')
     if len(labels)>=20 and labels.loc[labels.event,'cohort'].nunique()>=5:
         boundary=labels.index[int(len(labels)*.7)]
-        tr=(labels.index < boundary)&(labels.index+pd.to_timedelta(labels.duration_hours,unit='h') < boundary)
+        tr=(labels.index < boundary)&(labels.index+pd.to_timedelta(labels.duration_hours,unit='h') < boundary)&labels.label_available_at.le(boundary)
         te=labels.index >= boundary
         te &= ~labels.cohort.isin(set(labels.loc[tr,'cohort'])).to_numpy()
         if labels.loc[tr&labels.event,'cohort'].nunique()>=3 and labels.loc[te&labels.event,'cohort'].nunique()>=1:

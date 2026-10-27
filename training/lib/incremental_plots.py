@@ -13,15 +13,25 @@ def plot_preparation(context):
     threshold_label=f'Порог работы = {value}'+(f' {units}' if units else '')
     source={'manual':'задан вручную','initial_past':'рассчитан автоматически'}.get(
         c['threshold_source'],c['threshold_source'])
-    fig,axes=plt.subplots(2,1,figsize=(15,6),sharex=True)
+    has_currents=any(d.get('threshold') is not None for d in c.get('regime_spec',{}).get('channels',{}).values())
+    fig,axes=plt.subplots(3 if has_currents else 2,1,figsize=(15,8 if has_currents else 6),sharex=True)
     axes[0].plot(c['frame'].index,c['frame'][c['load']],linewidth=.6,label=c['load'])
     axes[0].axhline(c['threshold'],color='red',label=threshold_label)
+    off=c['threshold']*c.get('regime_policy',{}).get('off_fraction',.9)
+    if off!=c['threshold']:axes[0].axhline(off,color='gray',linestyle='--',label=f'Граница выключения = {off:g}')
     axes[0].set_title(f'{c["unit"]} · {threshold_label} · {source}')
     axes[0].set_ylabel('Нагрузка'+(f', {units}' if units else ''))
     axes[0].legend()
     modes={'стоит':0,'неизвестно':1,'пуск':2,'работа':3}
     axes[1].step(c['frame'].index,c['regime']['mode'].map(modes),where='post')
     axes[1].set_yticks(list(modes.values()),list(modes))
+    if has_currents:
+        for key,label in [('mill','Пылесистема: ММТ / МВ'),('feeder','Питатели угля'),('draft','Тягодутьевые приводы')]:
+            col='evidence::'+key+'_active'
+            if col in c['regime']:axes[2].step(c['regime'].index,c['regime'][col],where='post',label=label)
+        conflict=c['regime'].get('evidence_conflict',pd.Series(False,index=c['frame'].index))
+        axes[2].scatter(c['regime'].index[conflict],np.zeros(int(conflict.sum())),s=8,color='red',label='Противоречие нагрузки и токов')
+        axes[2].set_ylabel('Число включённых');axes[2].legend(fontsize=8)
     for event in c['events'].itertuples():
         axes[0].axvspan(event.start,event.end,color='red' if event.type=='Авария' else 'gray',alpha=.15)
     fig.tight_layout()

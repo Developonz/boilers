@@ -29,10 +29,20 @@ def render(snapshot):
     history=('<details><summary>Последние завершённые этапы</summary><ul>'+''.join(
         f'<li>{escape(str(item))}</li>' for item in recent)+'</ul></details>' if recent else '')
     note=escape(str(snapshot.get('notice','')))
+    title=escape(str(snapshot.get('title','Обучение и проверка моделей')))
+    months=snapshot.get('month_total',0)
+    overall=('' if not months else f'<div>Месячные срезы: {snapshot.get("month_done",0)}/{months} · '
+        f'{100*snapshot.get("month_done",0)/months:.1f}%</div><progress value="{snapshot.get("month_done",0)}" '
+        f'max="{months}" aria-label="Месячные срезы" style="width:100%;height:14px"></progress>')
+    risk_total=snapshot.get('risk_total',0)
+    if risk_total:
+        done=snapshot.get('risk_done',0)
+        overall+=f'<div>Исторические срезы риска: {done}/{risk_total} · {100*done/risk_total:.1f}%</div>'
+        overall+=f'<progress value="{done}" max="{risk_total}" aria-label="История риска" style="width:100%;height:14px"></progress>'
     return (
         '<div style="font:14px/1.5 system-ui,sans-serif;max-width:1100px;'
         'padding:12px 16px;border:1px solid #94a3b8;border-radius:8px;overflow-wrap:anywhere">'
-        f'<b style="color:{color}">Обучение и проверка моделей</b>'
+        f'<b style="color:{color}">{title}</b>{overall}'
         f'<div><b>Этап:</b> {escape(str(snapshot.get("phase","Подготовка")))}</div>'
         f'<progress{value} aria-label="Ход текущего этапа" style="width:100%;height:20px;accent-color:{color}"></progress>'
         f'<div>{count_text}{eta} · этап: {duration(snapshot.get("phase_seconds",0))}'

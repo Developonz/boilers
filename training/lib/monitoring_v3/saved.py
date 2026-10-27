@@ -21,8 +21,9 @@ def run_saved(model_dir, data_path, target_unit, *, sensor_file, period_start=No
     if require_unseen_unit and target_unit in metadata['training_units']:
         raise ValueError('Recipient participated in model training')
     with _runtime(folder, 'incremental') as (model, _), numerical_threads(threads):
-        raw = _read_grid(data_path, pd.Timedelta(model.config['step']))
+        import k2_lib as K
         rows = G.read_roles(sensor_file, target_unit)
+        raw=model.normalize_input(K.read_table(str(data_path)),roles=rows)
         # Align the recipient's load role by physical steam-flow role, with unit validation.
         training = [{**r, 'role':model.roles.get(r['key'], r['role'])} for r in rows]
         recipient_load = [r for r in training if r['role'] == 'load']

@@ -825,7 +825,7 @@ def technical_state(ev: Evaluation) -> Dict[str, Any]:
         label = {M_STOP: "Котёл стоит", M_START: "Пуск котла"}.get(ev.mode_now, "Нет данных")
         trend = ev.not_scored_reason[:1].upper() + ev.not_scored_reason[1:]
     elif ev.alarm_now:
-        status, label, level = "critical", "Тревога", "A"
+        status, label, level = "critical", "Устойчивое отклонение", "A"
         trend = "Устойчивое отклонение от нормы режима"
     elif ratio is not None and ratio > 1:
         status, label, level = "warning", "Отклонение", "B"
@@ -840,6 +840,7 @@ def technical_state(ev: Evaluation) -> Dict[str, Any]:
         "technicalStatusLabel": label,
         "riskLevel": level,
         "healthScore": ev.health_now,
+        "healthMeaning": "Соответствие ожидаемому режиму; это не вероятность аварии и не остаточный ресурс",
         "healthTrend": trend,
         "modelRatio": fnum(ratio, 3),
         "modelAlarm": ev.alarm_now,

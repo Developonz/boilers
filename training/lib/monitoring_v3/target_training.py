@@ -17,6 +17,7 @@ from .artifacts import _file_operation
 
 _store=ContextVar('initial_target_store',default=None)
 _last_failed_fit=None
+INITIAL_CONTRACT='initial-model-v1'
 
 
 @lru_cache(maxsize=1)
@@ -34,61 +35,84 @@ def training_scope(method, native, targets, cfg):
 
 
 class TargetStore:
-    def __init__(self, folder, token):
+    def __init__(self, folder, token, progress=None):
         self.folder=Path(folder);self.folder.mkdir(parents=True,exist_ok=True)
         self.token=token
         self.rescue=None
+        self.contexts={};self.progress=progress
         path=self.folder/'fingerprint.json'
-        if path.exists() and json.loads(path.read_text(encoding='utf-8'))['fingerprint']!=token:
-            raise ValueError('Initial-target cache is incompatible; use a new output directory: '+str(path))
-        if not path.exists():
+        try:previous=json.loads(path.read_text(encoding='utf-8')).get('fingerprint')
+        except (OSError,ValueError):previous=None
+        if previous!=token:
             temporary=path.with_name(path.name+'.'+uuid.uuid4().hex+'.tmp')
             try:
-                temporary.write_text(json.dumps({'fingerprint':token}),encoding='utf-8')
+                temporary.write_text(json.dumps({'fingerprint':token,'contract':INITIAL_CONTRACT}),encoding='utf-8')
                 _file_operation(lambda:os.replace(temporary,path))
             finally:
                 if temporary.exists():_file_operation(temporary.unlink)
+            if previous and progress:
+                progress.say('Кэш целей найден после изменения кода/настроек: проверка по фактическим '
+                             'входам и параметрам, без удаления старых моделей.',status='initial_cache_revalidate')
 
     def scope(self, method, native, targets, cfg):
-        return training_scope(method,native,targets,cfg)
+        scope=training_scope(method,native,targets,cfg)
+        self.contexts[scope]=(method,cfg)
+        return scope
+
+    def _compatible(self,data,scope,target):
+        if data.get('target')!=target or data.get('contract',INITIAL_CONTRACT)!=INITIAL_CONTRACT:return False
+        method,cfg=self.contexts[scope]
+        predictor=data.get('predictor')
+        if predictor is None:return data.get('status')=='insufficient_data'
+        kind,value=predictor
+        if kind in ('constant','reference'):return np.isscalar(value) and np.isfinite(value)
+        if method=='CatBoost' and kind=='catboost':
+            expected=dict(loss_function='MultiQuantile:alpha=0.25,0.5,0.75',depth=cfg['cb_depth'],
+                          learning_rate=cfg['learning_rate'],random_seed=cfg['seed'])
+            params=value.get_params()
+            return value.tree_count_==cfg['cb_initial_trees'] and all(params.get(k)==v for k,v in expected.items())
+        return method=='HistGradientBoosting' and kind=='hist' and len(value)==3
 
     def path(self, scope, target):
         key=hashlib.sha256(str(target).encode()).hexdigest()[:24]
         return self.folder/scope/(key+'.joblib')
 
     def restore(self, scope, target):
+        if scope not in self.contexts:raise ValueError('Target scope must be validated against current data')
         path=self.path(scope,target)
         if not path.exists():
             rescued=self.folder/'rescued_targets.joblib'
             if self.rescue is None:
                 self.rescue=joblib.load(rescued) if rescued.exists() else {}
             if self.rescue and self.rescue.get('scope')!=scope:
-                raise ValueError('Спасённые модели не соответствуют данным или параметрам обучения. '
-                                 'Сохраните прежние данные/параметры либо выберите другую output.')
+                if self.progress:self.progress.say('Ранее перенесённые цели не подходят текущим данным: '
+                    'будут обучены новые; старый файл сохранён.',status='initial_rescue_skipped')
+                self.rescue={}
             if self.rescue.get('scope')==scope and target in self.rescue.get('predictors',{}):
                 predictor=self.rescue['predictors'][target]
                 status='trained' if predictor[0]=='catboost' else predictor[0]
-                self.save(scope,target,predictor,status)
-                return dict(fingerprint=self.token,target=target,predictor=predictor,status=status)
+                data=dict(fingerprint=self.token,target=target,predictor=predictor,status=status)
+                if self._compatible(data,scope,target):
+                    self.save(scope,target,predictor,status)
+                    return data
             return None
         data=joblib.load(path)
-        if data['fingerprint']!=self.token or data['target']!=target:
-            raise ValueError('Initial-target cache does not match the current input: '+str(path))
-        return data
+        return data if self._compatible(data,scope,target) else None
 
     def save(self, scope, target, predictor, status):
         path=self.path(scope,target);path.parent.mkdir(parents=True,exist_ok=True)
         temporary=path.with_name(path.name+'.'+uuid.uuid4().hex+'.tmp')
         try:
-            joblib.dump(dict(fingerprint=self.token,target=target,predictor=predictor,status=status),temporary,compress=3)
+            joblib.dump(dict(fingerprint=self.token,contract=INITIAL_CONTRACT,
+                             target=target,predictor=predictor,status=status),temporary,compress=3)
             _file_operation(lambda:os.replace(temporary,path))
         finally:
             if temporary.exists():_file_operation(temporary.unlink)
 
 
 @contextmanager
-def initial_targets(folder, token):
-    marker=_store.set(TargetStore(folder,token))
+def initial_targets(folder, token, progress=None):
+    marker=_store.set(TargetStore(folder,token,progress=progress))
     try:yield
     finally:_store.reset(marker)
 

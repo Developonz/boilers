@@ -1,5 +1,7 @@
 """Predictors with explicit inheritance of fitted state; no hidden monthly refit."""
 from copy import deepcopy
+from pathlib import Path
+import json
 import numpy as np
 import pandas as pd
 from .preparation import FrozenEncoder
@@ -36,6 +38,10 @@ def balanced_rows(features, limit):
         return np.arange(len(features))
     cats = [c for c in features if not pd.api.types.is_numeric_dtype(features[c])]
     numeric = [c for c in features if pd.api.types.is_numeric_dtype(features[c])]
+    # Feature construction explicitly identifies the physical load; sorted
+    # pooled columns must not accidentally balance on a temperature instead.
+    load=features.attrs.get('load_column')
+    if load in numeric:numeric=[load]+[c for c in numeric if c!=load]
     strata = features[cats].fillna('__MISSING__').astype(str).agg('|'.join, axis=1) if cats else pd.Series('', index=features.index)
     if numeric:
         x = pd.to_numeric(features[numeric[0]], errors='coerce')
@@ -52,6 +58,32 @@ def balanced_rows(features, limit):
                 if len(chosen) == limit:
                     return np.sort(chosen)
     return np.sort(chosen)
+
+
+def operating_support(model,features):
+    memory=getattr(model,'memory_f',None)
+    if memory is None or not len(memory):return pd.DataFrame(dict(regime_seen=False,load_extrapolation=True),index=features.index)
+    cats=[c for c in memory if c in features and not pd.api.types.is_numeric_dtype(memory[c])]
+    if cats:
+        known=memory[cats].fillna('__MISSING__').astype(str).agg('|'.join,axis=1)
+        query=features[cats].fillna('__MISSING__').astype(str).agg('|'.join,axis=1)
+        seen=query.isin(set(known))
+    else:seen=pd.Series(True,index=features.index)
+    load=features.attrs.get('load_column')
+    outside=pd.Series(False,index=features.index)
+    if load in memory:
+        x=pd.to_numeric(features[load],errors='coerce');past=pd.to_numeric(memory[load],errors='coerce')
+        outside=~x.between(past.min(),past.max())
+    conditions=[c for c in features.attrs.get('condition_columns',[]) if c in memory and pd.api.types.is_numeric_dtype(memory[c])]
+    ranges={};constant={}
+    for c in conditions:
+        past=pd.to_numeric(memory[c],errors='coerce').dropna();query=pd.to_numeric(features[c],errors='coerce')
+        if not len(past):continue
+        ranges[c]=(~query.between(past.min(),past.max())).where(query.notna()).astype(float)
+        if past.nunique()==1:constant[c]=query.sub(past.iloc[0]).abs().gt(1e-9).where(query.notna()).astype(float)
+    return pd.DataFrame(dict(regime_seen=seen,load_extrapolation=outside,
+        condition_extrapolation_fraction=pd.DataFrame(ranges,index=features.index).mean(axis=1),
+        constant_condition_changed=pd.DataFrame(constant,index=features.index).max(axis=1)),index=features.index)
 
 
 class LinearStats:
@@ -90,6 +122,11 @@ class NormalModel:
         # Nonzero explicit reference for a first change in a formerly constant sensor.
         self.scale = np.maximum(sc, np.maximum(np.abs(self.centers)*.001, 1e-3))
         self.floor = np.maximum(self.scale*.1, 1e-6)
+        rules=json.loads(Path(self.cfg['sensor_rules']).read_text(encoding='utf-8')) if Path(self.cfg['sensor_rules']).exists() else {}
+        effective=[{**rules.get('defaults',{}),**rules.get('sensors',{}).get(c,{})} for c in self.targets]
+        limits=[max(float(rule.get('scale_floor',0)),float(rule.get('resolution',0))) for rule in effective]
+        self.floor=np.maximum(self.floor,limits)
+        self.engineering_floor=self.floor.copy()
         keep = balanced_rows(features, self.cfg['memory_rows'])
         self.memory_f = features.iloc[keep].copy()
         self.memory_y = targets.iloc[keep].copy()
@@ -137,7 +174,8 @@ class NormalModel:
                 reporter.done('insufficient_data')
                 continue
             y = targets.loc[good, col].to_numpy(float)
-            if np.ptp(y) <= 1e-12:
+            previous = self.predictors.get(col)
+            if np.ptp(y) <= 1e-12 and not (previous and previous[0]=='catboost'):
                 # No tree can learn variation that has never been observed.
                 self.predictors.setdefault(col, ('constant', float(np.median(y))))
                 if store:store.save(scope,col,self.predictors[col],'constant')
@@ -176,9 +214,11 @@ class NormalModel:
                 model = CatBoostRegressor(loss_function='MultiQuantile:alpha=0.25,0.5,0.75',
                     iterations=trees, depth=self.cfg['cb_depth'], learning_rate=self.cfg['learning_rate'],
                     random_seed=self.cfg['seed'], thread_count=self.cfg['threads'],
-                    has_time=True, allow_writing_files=False, verbose=False, task_type='CPU')
+                    has_time=True, allow_writing_files=False, verbose=False, task_type='CPU',allow_const_label=True,
+                    boost_from_average=False if old is not None else None)
                 callbacks={'callbacks':[reporter]} if reporter.progress else {}
-                model.fit(native.loc[good], y, cat_features=cats, init_model=old,**callbacks)
+                from .continuation import fit_continued
+                fit_continued(model,native.loc[good],y,old,cat_features=cats,**callbacks)
                 self.predictors[col] = ('catboost', model)
             if store:store.save(scope,col,self.predictors[col],'trained')
             reporter.done('trained')
@@ -241,9 +281,10 @@ class NormalModel:
                             thread_count=self.cfg['threads'])
             return self.encoder.numeric(features)
 
-    def expected(self, features, actual, *, prediction_input=None):
+    def expected(self, features, actual, *, prediction_input=None,diagnostic_start=None):
         n, p = len(features), len(self.targets)
         med, spread = np.full((n, p), np.nan), np.full((n, p), np.nan)
+        diagnostics=[]
         if self.method in ('CatBoost', 'HistGradientBoosting'):
             tree_input=prediction_input
             if n and tree_input is None and any(kind in ('catboost','hist') for kind,_ in self.predictors.values()):
@@ -258,13 +299,23 @@ class NormalModel:
                     continue
                 kind, model = item
                 if kind in ('constant','reference'):
-                    med[:, j], spread[:, j] = model, self.scale[j]
+                    med[:, j], spread[:, j] = model, max(self.scale[j],self.floor[j])
                     reporter.done(kind)
                     continue
                 pred = (model.predict(tree_input,thread_count=self.cfg['threads']) if kind == 'catboost' else
                         np.column_stack([m.predict(tree_input) for m in model]))
                 # Sorting repairs crossing; interval diagnostics are reported separately.
+                good=actual[col].notna().to_numpy()&np.isfinite(pred).all(axis=1) if col in actual else np.zeros(n,bool)
+                if diagnostic_start is not None:good&=features.index>=pd.Timestamp(diagnostic_start)
+                crossing=np.any(np.diff(pred,axis=1)<0,axis=1)
                 pred = np.sort(pred, axis=1)
+                if good.any():
+                    truth=actual[col].to_numpy()[good];ordered=pred[good]
+                    diagnostics.append(dict(sensor=col,observed=int(good.sum()),
+                        raw_crossing_fraction=float(crossing[good].mean()),
+                        central50_coverage=float(((truth>=ordered[:,0])&(truth<=ordered[:,2])).mean()),
+                        median_interval_width=float(np.median(ordered[:,2]-ordered[:,0])),
+                        median_absolute_error=float(np.median(abs(truth-ordered[:,1])))))
                 med[:, j], spread[:, j] = pred[:, 1], np.maximum((pred[:, 2]-pred[:, 0])/1.349, self.floor[j])
                 reporter.done()
         else:
@@ -282,8 +333,9 @@ class NormalModel:
                 spread = np.maximum(spread, self.floor)
         valid = self.counts >= self.cfg['min_sensor_rows']
         med[:, ~valid], spread[:, ~valid] = np.nan, np.nan
-        return (pd.DataFrame(med, index=features.index, columns=self.targets),
-                pd.DataFrame(spread, index=features.index, columns=self.targets))
+        center=pd.DataFrame(med,index=features.index,columns=self.targets)
+        center.attrs['prediction_diagnostics']=diagnostics
+        return center,pd.DataFrame(spread,index=features.index,columns=self.targets)
 
     def errors(self, features, actual):
         med, spread = self.expected(features, actual)
@@ -348,6 +400,15 @@ class NormalModel:
             oe = validation_y.sub(om).abs().div(self.scale).median().median()
             ne = validation_y.sub(nm).abs().div(self.scale).median().median()
             accepted = bool(np.isfinite(ne) and (not np.isfinite(oe) or ne <= max(oe, 1e-6)*(1+self.cfg['validation_tolerance'])))
+            per_old=actual.sub(om).abs().div(self.scale).median()
+            per_new=actual.sub(nm).abs().div(self.scale).median()
+            critical=[c for c in self.cfg.get('critical_sensors',[]) if c in actual]
+            failed=[c for c in critical if pd.notna(per_new[c]) and pd.notna(per_old[c]) and
+                    per_new[c]>max(float(per_old[c]),1e-6)*(1+self.cfg['validation_tolerance'])]
+            catastrophic=[c for c in actual if pd.notna(per_new[c]) and pd.notna(per_old[c]) and
+                          per_new[c]>max(float(per_old[c])*3.,.5)]
+            failed=sorted(set(failed+catastrophic))
+            accepted=accepted and not failed
             progress=current_progress()
             if progress:
                 progress.say(('Кандидат принят' if accepted else 'Кандидат отклонён')+
@@ -355,7 +416,9 @@ class NormalModel:
                     accepted=accepted,old_physical_error=float(oe),new_physical_error=float(ne))
         return candidate if accepted else self, dict(accepted=accepted, old_error=float(old), new_error=float(new),
                                                     old_physical_error=float(oe), new_physical_error=float(ne),
-                                                    validation_status='checked',trees=candidate.tree_counts())
+                                                    validation_status='checked',critical_regressions=failed,
+                                                    target_errors={c:dict(old=float(per_old[c]),new=float(per_new[c])) for c in actual},
+                                                    trees=candidate.tree_counts())
 
 
 class RelatedModel:
@@ -383,6 +446,10 @@ class RelatedModel:
     def update(self, features, targets):
         for c, model in self.members.items():
             model.update(self._inputs(features, c), targets[[c]])
+        f=pd.concat([self.memory_f,features]).sort_index()
+        y=pd.concat([self.memory_y,targets]).reindex(f.index)
+        keep=balanced_rows(f,self.cfg['memory_rows'])
+        self.memory_f,self.memory_y=f.iloc[keep],y.iloc[keep]
         self.updates += 1
         return self
 
@@ -425,19 +492,25 @@ class AnalogCorrection:
             raise ValueError('Insufficient out-of-sample healthy analog residuals')
         self.targets = list(targets)
         self.base = NormalModel('analogs',self.cfg).fit_initial(features.loc[first],targets.loc[first])
+        self.centers=self.base.centers.copy()
         cf, med = self._correction_inputs(features.loc[~first])
         self.correction = NormalModel('CatBoost',self.cfg).fit_initial(cf,targets.loc[~first]-med)
-        self.base.update(features.loc[~first],targets.loc[~first])
+        # Keep the reference fixed: otherwise correction labels would describe
+        # an older analog predictor than the one used when applying the model.
         self.scale = self.base.scale
-        self.memory_f, self.memory_y = self.base.memory_f, self.base.memory_y
+        self.floor=self.base.floor.copy()
+        self.engineering_floor=self.base.engineering_floor.copy()
+        rows=balanced_rows(features,self.cfg['memory_rows'])
+        self.memory_f, self.memory_y = features.iloc[rows], targets.iloc[rows]
         return self
 
     def update(self, features, targets):
         cf, med = self._correction_inputs(features)
-        # Labels are produced BEFORE admitting new rows to the analog memory.
+        # Every generation learns residuals against the same independent base.
         self.correction.update(cf,targets-med)
-        self.base.update(features,targets)
-        self.memory_f,self.memory_y = self.base.memory_f,self.base.memory_y
+        f=pd.concat([self.memory_f,features]);y=pd.concat([self.memory_y,targets])
+        rows=balanced_rows(f,self.cfg['memory_rows'])
+        self.memory_f,self.memory_y = f.iloc[rows],y.iloc[rows]
         self.updates += 1
         return self
 
@@ -445,7 +518,7 @@ class AnalogCorrection:
         cf, med = self._correction_inputs(features)
         bias, _ = self.correction.expected(cf,actual)
         _, spread = self.base.expected(features,actual)
-        return med+bias, spread
+        return med+bias, spread.clip(lower=pd.Series(self.floor,index=self.targets),axis=1)
 
     def errors(self, features, actual):
         med,spread = self.expected(features,actual)
@@ -462,8 +535,13 @@ class MultiTargetModel(NormalModel):
     def fit_initial(self, features, targets):
         self.targets=list(targets);self.encoder=FrozenEncoder.fit(features)
         self.counts=targets.count().to_numpy(copy=True)
+        self.centers=targets.median().to_numpy(float)
         self.scale=targets.std().fillna(0).clip(lower=1e-3).to_numpy(float)
         self.floor=self.scale*.1
+        rules=json.loads(Path(self.cfg['sensor_rules']).read_text(encoding='utf-8')) if Path(self.cfg['sensor_rules']).exists() else {}
+        policies=[{**rules.get('defaults',{}),**rules.get('sensors',{}).get(c,{})} for c in self.targets]
+        self.floor=np.maximum(self.floor,[max(float(p.get('scale_floor',0)),float(p.get('resolution',0))) for p in policies])
+        self.engineering_floor=self.floor.copy()
         self._fit_shared(features,targets,None)
         rows=balanced_rows(features,self.cfg['memory_rows'])
         self.memory_f,self.memory_y=features.iloc[rows],targets.iloc[rows]
@@ -477,10 +555,11 @@ class MultiTargetModel(NormalModel):
         self.shared=CatBoostRegressor(loss_function='MultiRMSEWithMissingValues',iterations=n,
             depth=self.cfg['cb_depth'],learning_rate=self.cfg['learning_rate'],has_time=True,
             random_seed=self.cfg['seed'],thread_count=self.cfg['threads'],allow_writing_files=False,verbose=False,
-            allow_const_label=True)
+            allow_const_label=True,boost_from_average=False if old is not None else None)
         observed=y.notna().any(axis=1)
-        self.shared.fit(self.encoder.native(f.loc[observed]),y.loc[observed]/self.scale,
-                        cat_features=list(self.encoder.categories),init_model=old)
+        from .continuation import fit_continued
+        fit_continued(self.shared,self.encoder.native(f.loc[observed]),y.loc[observed]/self.scale,old,
+                        cat_features=list(self.encoder.categories))
 
     def update(self, features, targets):
         rows=balanced_rows(self.memory_f,self.cfg['replay_rows'])
@@ -498,7 +577,7 @@ class MultiTargetModel(NormalModel):
         med=np.asarray(self.shared.predict(self.encoder.native(features),thread_count=self.cfg['threads'])).reshape(len(features),len(self.targets))*self.scale
         med[:,self.counts < self.cfg['min_sensor_rows']]=np.nan
         return pd.DataFrame(med,index=features.index,columns=self.targets),pd.DataFrame(
-            np.broadcast_to(self.scale,med.shape),index=features.index,columns=self.targets)
+            np.broadcast_to(np.maximum(self.scale,self.floor),med.shape),index=features.index,columns=self.targets)
 
     def tree_counts(self):
         return {'shared':self.shared.tree_count_}
