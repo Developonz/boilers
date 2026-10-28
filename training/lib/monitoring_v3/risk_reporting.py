@@ -16,6 +16,7 @@ REASONS={
     'history_disabled':'помесячная проверка риска выключена',
     'historical_risk_not_computed':'история риска ещё не рассчитана',
     'outside_risk_history':'эта тревога вне рассчитанной истории риска',
+    'requires_monthly_training':'нужно выполнить раздел 3 с помесячным обучением риска',
 }
 
 
@@ -29,8 +30,13 @@ def readiness_rows(statuses,cfg):
         tr=partitions.get('deployment_train',{}).get('groups',{})
         cal=partitions.get('deployment_calibration',{}).get('groups',{})
         policy=cfg['risk_policy']
+        measured=status.get('prequential',{})
         rows.append(dict(голова=head,статус=status.get('status','not_run'),
             область=status.get('scope',cfg['risk_policy']['scope']),котлы=', '.join(status.get('units',[])),
+            обучение=status.get('fit_status','ожидание'),деревьев=status.get('trees',0),
+            новых_обученных_строк=status.get('new_training_rows',0),
+            precision_балла=measured.get('raw_score',{}).get('precision'),
+            precision_вероятности=measured.get('probability',{}).get('precision'),
             пояснение=REASONS.get(status.get('status'),'см. подробный статус'),
             аварийных_групп_всего=sum(a.get('positive_events',0) for a in audits),
             зарегистрировано_аварий=sum(a.get('registered_emergencies',0) for a in audits),

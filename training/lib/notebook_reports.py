@@ -303,7 +303,9 @@ def apply_episode_labels(cfg, edits):
     return episode_catalog(cfg)
 
 
-def run_interpretation(cfg, contexts, enabled=True, as_of=None, attach=False,live_report=None,risk_history=False):
+def run_interpretation(cfg, contexts, enabled=True, as_of=None, attach=False,live_report=None,risk_history=False,reuse_monthly=True):
+    if reuse_monthly:
+        return _monthly_interpretation_report(cfg,contexts,enabled,as_of,attach,live_report)
     from interpretation_training import train,train_risk_group
     from monitoring_v3.progress import Progress
     rows=[]
@@ -370,6 +372,50 @@ def run_interpretation(cfg, contexts, enabled=True, as_of=None, attach=False,liv
         path=folder/'feature_importance.csv'
         if path not in shown:
             show_feature_importance(path,title=row['unit']+' · '+row['head']);shown.add(path)
+    return result
+
+
+def _monthly_interpretation_report(cfg,contexts,enabled,as_of,attach,live_report):
+    """Section 7 reads the risk trained in section 3; only reviewed causes fit here."""
+    from interpretation_training import train
+    from monitoring_v3.monthly_risk import saved_monthly_statuses
+    from monitoring_v3.risk_reporting import readiness_rows
+    from monitoring_v3.risk_history import read_risk_timeline
+    from monitoring_v3.progress import Progress
+    items=experiment_directories(cfg);rows=[];ready=[];shown=set()
+    progress=Progress(Path(cfg['output'])) if enabled else None
+    for item in items:
+        if as_of is not None:date=pd.Timestamp(as_of)
+        elif cfg['risk_policy']['scope']=='group':
+            spec=json.loads((item['directory'].parent/'experiment.json').read_text(encoding='utf-8'))
+            units=cfg['groups'].get(spec.get('group'),[item['unit']])
+            date=max(contexts[u]['frame'].index[-1] for u in units)
+        else:date=contexts[item['unit']]['frame'].index[-1]
+        statuses=saved_monthly_statuses(item['directory'],date)
+        if statuses is None:
+            statuses={f'risk_{h}h':{'status':'requires_monthly_training',
+                'detail':'Выполните раздел 3: риск обучается вместе с детекторами по месяцам.'} for h in cfg['risk_horizons']}
+        if enabled:
+            with progress.stage('Проверенные причины · '+item['experiment']+' · '+item['unit']):
+                statuses=train(cfg,item['directory'],item['unit'],date,attach=attach,contexts=contexts,risk_statuses=statuses)
+        for head,status in statuses.items():rows.append(dict(experiment=item['experiment'],unit=item['unit'],head=head,**status))
+        for head,status in statuses.items():
+            if status.get('status') not in ('trained','trained_uncalibrated'):continue
+            folder=Path(status['shared_head']).parent if status.get('shared_head') else item['directory']/'interpretation'/head
+            path=folder/'feature_importance.csv'
+            if path.exists() and path not in shown:
+                show_feature_importance(path,title=head+' · версия на '+str(status.get('available_at',date)))
+                shown.add(path)
+        table=readiness_rows(statuses,cfg)
+        if len(table):
+            table.insert(0,'котёл',item['unit']);table.insert(0,'эксперимент',item['experiment']);ready.append(table)
+        if live_report:
+            history=read_risk_timeline(item['directory'],cfg,contexts[item['unit']])
+            live_report.safely('set_monthly_risk',item,statuses,history)
+    if progress:progress.say('Риск прочитан из раздела 3; разбор причин завершён',status='complete')
+    result=pd.DataFrame(rows)
+    if ready:show_table('Готовность помесячного риска из раздела 3',pd.concat(ready,ignore_index=True),True)
+    show_table('Классификаторы: помесячный риск и подтверждённые причины',result,True)
     return result
 
 

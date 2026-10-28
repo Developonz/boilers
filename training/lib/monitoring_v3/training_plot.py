@@ -18,7 +18,8 @@ def plot_training_timeline(timeline,context,cfg,title='',risk=None,statuses=None
     if 'active' not in d or 'notification' not in d:
         from .alarm_scores import alarm_stream,view_policy
         stream,_=alarm_stream(timeline.ratio,view_policy(cfg,view))
-        d=d.assign(active=stream.active.reindex(d.index),notification=stream.notification.reindex(d.index))
+        timeline=timeline.assign(active=stream.active,notification=stream.notification)
+        d=timeline.loc[left:end]
     fig,(ax,ax2)=plt.subplots(2,1,figsize=(15,5.3),sharex=True,gridspec_kw={'height_ratios':[4,1]})
     if d.empty:
         ax.text(.5,.5,'Период проверки ещё не рассчитан',transform=ax.transAxes,ha='center')
@@ -41,10 +42,11 @@ def plot_training_timeline(timeline,context,cfg,title='',risk=None,statuses=None
     ax.plot(daily.index,daily,color='#2c3e50',lw=1)
     ax.axhline(1,color='#c0392b',ls='--',lw=1.2);_score_scale(ax,daily)
     ax.set_ylabel('ошибка / порог')
-    metrics,_=evaluate(d,context['events'],cfg,start=left,end=right)
+    metrics,_=evaluate(timeline,context['events'],cfg,start=left,end=right)
     number=lambda v: f'{v:.3f}' if np.isfinite(v) else '—'
     ax.set_title(f'{title}\n{view}: PR AUC {number(metrics["average_precision"])} '
-        f'(случайно {number(metrics["random_precision"])}), поймано аварий '
+        f'(случайно {number(metrics["random_precision"])}), Precision {number(metrics["precision"])} · '
+        f'Recall {number(metrics["recall"])}\nпоймано аварий '
         f'{metrics["detected"]}/{metrics["events"]}, тревог в фоне '
         f'{number(metrics["alarms_per_720h"])}/720 ч, доля фона в тревоге '
         f'{number(100*metrics["background_fraction"])}%',fontsize=10)

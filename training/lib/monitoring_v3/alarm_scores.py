@@ -140,6 +140,36 @@ def calibrate_threshold(score, cfg, budget=None):
     raise AssertionError('Upper threshold must yield no alarms')
 
 
+def _precision(timeline,positive,background,uncertain,valid,cfg,start,end):
+    """Notification precision; unknown/neutral/unobserved outcomes are excluded."""
+    ix=timeline.index;step=pd.Timedelta(cfg['step']);horizon=pd.Timedelta(days=cfg['pre_window_days'])
+    observed=timeline.get('load_observed',pd.Series(True,index=ix)).fillna(False).to_numpy(bool)
+    times=ix.as_unit('ns').asi8
+    left=np.arange(len(ix))+1;right=np.searchsorted(times,times+horizon.value,side='right')
+    bad=np.r_[0,np.cumsum(~observed)]
+    expected=int(math.ceil(horizon/step))
+    complete=pd.Series((times+horizon.value<=times[-1])&(right-left>=expected)&(bad[right]==bad[left]),index=ix)
+    true=positive&~uncertain&valid;false=background&complete
+    notices=timeline.notification.fillna(False)&valid
+    tp=int((notices&true).sum());fp=int((notices&false).sum())
+    active=timeline.active.fillna(False).to_numpy(bool)
+    contiguous=np.r_[False,np.diff(times)==step.value]
+    starts=np.flatnonzero(active&(~np.r_[False,active[:-1]]|~contiguous))
+    ends=np.flatnonzero(active&(~np.r_[active[1:],False]|~np.r_[contiguous[1:],False]))+1
+    etp=efp=excluded=0
+    for a,b in zip(starts,ends):
+        if not start<=ix[a]<end or not valid.iloc[a]:continue
+        if true.iloc[a:b].any():etp+=1
+        elif false.iloc[a:b].any():efp+=1
+        else:excluded+=1
+    return dict(precision=tp/(tp+fp) if tp+fp else np.nan,
+        precision_true_notifications=tp,precision_false_notifications=fp,
+        precision_excluded_notifications=int(notices.sum())-tp-fp,
+        precision_incomplete_future_notifications=int((notices&background&~complete).sum()),
+        episode_precision=etp/(etp+efp) if etp+efp else np.nan,
+        precision_true_episodes=etp,precision_false_episodes=efp,precision_excluded_episodes=excluded)
+
+
 def evaluate(timeline, events, cfg, start=None, end=None):
     ix = timeline.index
     step = pd.Timedelta(cfg['step'])
@@ -201,4 +231,5 @@ def evaluate(timeline, events, cfg, start=None, end=None):
     summary['working_unscored_hours']=float((eligible&~valid).sum()*step/pd.Timedelta('1h'))
     summary['non_working_hours']=float((period&~eligible).sum()*step/pd.Timedelta('1h'))
     summary['availability_operating']=float((eligible&valid).sum()/eligible.sum()) if eligible.any() else np.nan
+    summary.update(_precision(timeline,positive,background,uncertain,valid,cfg,start,end))
     return summary, pd.DataFrame(details)

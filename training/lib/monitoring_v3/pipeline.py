@@ -432,16 +432,21 @@ def score_month(state, context, spec, cfg, cutoff, end):
     return dict(views=result,frozen_views=frozen,errors=errors.loc[mask],features=features.loc[mask],diagnostics=diagnostics)
 
 
-def run(cfg,live_report=None):
+def run(cfg,live_report=None,interpretation=None,live_options=None):
     cfg=load(overrides=cfg)
     # Large numbers of small BLAS solves can stall with an unrestricted thread
     # pool. Apply the configured limit to the entire numerical lifecycle.
     from .notebook_live import report_scope
+    if live_report is None and live_options is not None:
+        from .notebook_live import LiveTrainingReport
+        live_report=LiveTrainingReport(cfg,live_options)
     with numerical_threads(cfg['threads']),report_scope(live_report):
-        return _run(cfg)
+        result=_run(cfg,interpretation)
+    if live_report is not None:result['live_report']=live_report
+    return result
 
 
-def _run(cfg):
+def _run(cfg,interpretation=None):
     root=Path(cfg['output']);root.mkdir(parents=True,exist_ok=True)
     progress=Progress(root)
     from .notebook_live import current_report
@@ -461,7 +466,7 @@ def _run(cfg):
     specs=list(experiments(cfg))
     progress.say(f'Запланировано экспериментов: {len(specs)}. Модели сохраняются после каждого месячного среза.')
     summaries,statuses,frozen_summaries,period_summaries=[],[],[],[]
-    for number,spec in enumerate(specs,1):
+    def _experiment(number,spec):
         progress.view=general_view
         name = '__'.join([spec['group'], spec['scenario'], '+'.join(spec['sources']), spec['method'], spec['variant'], str(spec['horizon'])])
         progress.say(f'Эксперимент {number}/{len(specs)}: {name}',experiment=name)
@@ -473,11 +478,11 @@ def _run(cfg):
         selected = align_contexts(contexts, members) if spec['scenario'] != 'local' else {u:contexts[u] for u in members}
         selected=transfer_preparation(selected,spec,cfg)
         if spec['variant'] == 'related' and not all(cfg['related_inputs'].get(c) for c in next(iter(selected.values()))['targets']):
-            statuses.append(dict(experiment=name, status='requires_reviewed_related_inputs')); continue
+            statuses.append(dict(experiment=name, status='requires_reviewed_related_inputs')); return
         first = pd.Timestamp(cfg['first_test'])
         # Recipients cannot cause models to be trained beyond donor observation time.
-        last = min(max(selected[u]['frame'].index[-1] for u in spec['recipients']),
-                   min(selected[u]['frame'].index[-1] for u in spec['sources']))
+        source_end=(max if spec['scenario']=='pooled' else min)(selected[u]['frame'].index[-1] for u in spec['sources'])
+        last = min(max(selected[u]['frame'].index[-1] for u in spec['recipients']),source_end)
         beginning=first
         if cfg['history_policy']['bootstrap']:
             reference=max(selected[u]['preparation_reference_end'] for u in spec['sources'])
@@ -487,12 +492,18 @@ def _run(cfg):
         months = [beginning]+list(pd.date_range(beginning+pd.offsets.MonthBegin(1), last, freq='MS'))
         if report:report.safely('start',name,spec,selected,months,progress)
         progress.say(f'Исторические признаки: с {beginning:%Y-%m-%d}; основной отчёт: с {first:%Y-%m-%d}')
+        items=[dict(experiment=name,unit=u,method=spec['method'],variant=spec['variant'],
+                    scenario=spec['scenario'],directory=dest/u) for u in spec['recipients']]
+        yield dict(kind='init',name=name,spec=spec,items=items,next_cutoff=months[0])
         state = None
         pieces = {u:{} for u in spec['recipients']}
         frozen_pieces={u:{} for u in spec['recipients']}
         error_parts, feature_parts, audit_rows = {u:[] for u in pieces}, {u:[] for u in pieces}, []
         prediction_diagnostics={u:[] for u in pieces}
         for month_number,cutoff in enumerate(months,1):
+            progress.view=general_view
+            if report:report.safely('select_items',items,progress)
+            following=months[month_number] if month_number<len(months) else None
             tag=f'{name} · месяц {month_number}/{len(months)} · {cutoff:%Y-%m}'
             with progress.stage(tag+' · проверка сохранённого состояния'):
                 token,state_token = signatures(selected, cutoff, cfg, spec)
@@ -527,7 +538,9 @@ def _run(cfg):
             if state is None:
                 progress.say('Модель пока не получена: '+json.dumps(audit,ensure_ascii=False,default=str))
                 write_update_reports(dest,audit_rows)
-                if report:report.safely('month',name,spec,month_number,pieces,selected,progress)
+                yield dict(kind='month',name=name,spec=spec,items=items,cutoff=cutoff,
+                    end=cutoff+pd.offsets.MonthBegin(1),next_cutoff=following,features={},
+                    pieces=pieces,selected=selected,number=month_number)
                 continue
             end = cutoff+pd.offsets.MonthBegin(1)
             from .importance import write_regressor_importance
@@ -552,6 +565,9 @@ def _run(cfg):
                         publish_export(history,current)
                     record_export(root,name,u,spec,state,cutoff,current,history)
                 progress.say('Готовая модель для дашборда: '+str(current.resolve()),model_dir=str(current.resolve()))
+                if not ((c['frame'].index>=cutoff)&(c['frame'].index<end)).any():
+                    progress.say(f'{u}: в {cutoff:%Y-%m} нет наблюдений; прогноз пропущен',status='no_month_observations')
+                    continue
                 cached=dest/'scored'/f'{cutoff:%Y-%m-%d}'/(u+'.joblib')
                 with progress.stage(tag+f' · {u} · оценки месяца и признаки'):
                     score_token=score_fingerprint(c,end,state_token)
@@ -570,13 +586,14 @@ def _run(cfg):
                 error_parts[u].append(month['errors']);feature_parts[u].append(month['features'])
             write_update_reports(dest,audit_rows)
             progress.say(tag+' · расчёт месяца завершён',status='month_complete')
-            if report:
-                with progress.stage(tag+' · обновление графика'):
-                    report.safely('month',name,spec,month_number,pieces,selected,progress)
+            from .monthly_risk import month_features
+            features=month_features(pieces,feature_parts,selected,spec,beginning,end,cfg,dest)
+            yield dict(kind='month',name=name,spec=spec,items=items,cutoff=cutoff,end=end,
+                next_cutoff=following,features=features,pieces=pieces,selected=selected,number=month_number)
         write_update_reports(dest,audit_rows)
         if state is None:
             if report:report.safely('finish',name,spec,progress,available=False)
-            statuses.append(dict(experiment=name, status='insufficient_history')); continue
+            statuses.append(dict(experiment=name, status='insufficient_history')); return
         from .interpretation import write_catalog
         for u in spec['recipients']:
             ud = dest/u; ud.mkdir(exist_ok=True)
@@ -584,6 +601,8 @@ def _run(cfg):
             full_index=full_index[(full_index>=beginning)&(full_index<months[-1]+pd.offsets.MonthBegin(1))]
             if not len(full_index):
                 statuses.append(dict(experiment=name,unit=u,status='no_recipient_observations_in_period'));continue
+            if not feature_parts[u]:
+                statuses.append(dict(experiment=name,unit=u,status='no_scored_recipient_history',model=str(ud/'model')));continue
             timeline_features = pd.concat(feature_parts[u]).sort_index().reindex(full_index)
             residuals = pd.concat(error_parts[u]).sort_index().reindex(full_index)
             residuals.to_parquet(ud/'prequential_errors.parquet')
@@ -594,6 +613,7 @@ def _run(cfg):
                     data = pd.concat(parts).sort_index().reindex(full_index)
                     data['eligible']=selected[u]['eligible'].reindex(full_index).fillna(False)
                     data['background_eligible']=selected[u]['frame']['Состояние'].reindex(full_index).eq('Работа')
+                    data['load_observed']=selected[u]['cleaned'][selected[u]['load']].reindex(full_index).notna()
                     # Persistence remains continuous across month boundaries.
                     for b in cfg['alarm_budgets']:
                         threshold = data['threshold_budget_'+str(b)]
@@ -618,6 +638,7 @@ def _run(cfg):
                     data=pd.concat(parts).sort_index().reindex(full_index)
                     data['eligible']=selected[u]['eligible'].reindex(full_index).fillna(False)
                     data['background_eligible']=selected[u]['frame']['Состояние'].reindex(full_index).eq('Работа')
+                    data['load_observed']=selected[u]['cleaned'][selected[u]['load']].reindex(full_index).notna()
                     for budget in cfg['alarm_budgets']:
                         threshold=data['threshold_budget_'+str(budget)]
                         ratio=data.smoothed/threshold.where(np.isfinite(threshold))
@@ -634,13 +655,70 @@ def _run(cfg):
         pd.DataFrame(frozen_summaries).to_csv(root/'comparison_frozen.csv',index=False,encoding='utf-8-sig')
         pd.DataFrame(period_summaries).to_csv(root/'comparison_periods.csv',index=False,encoding='utf-8-sig')
         if report:report.safely('finish',name,spec,progress)
+    # Advance every detector of a family to the same month before updating risk.
+    # Generators keep per-experiment state and the existing durable exports.
+    from .monthly_risk import MonthlyRisk,family_key,interpretation_options
+    risk_options=interpretation_options(interpretation)
+    families={};risk_rows=[]
+    for number,spec in enumerate(specs,1):families.setdefault(family_key(spec),[]).append((number,spec))
+    for members in families.values():
+        active=[];all_items=[]
+        for number,spec in members:
+            generator=_experiment(number,spec)
+            initial=next(generator,None)
+            if initial is None:continue
+            active.append([generator,initial]);all_items.extend(initial['items'])
+        if not active:continue
+        groups=[all_items] if cfg['risk_policy']['scope']=='group' else [[item] for item in all_items]
+        sessions=[MonthlyRisk(cfg,group,contexts,risk_options) for group in groups]
+        snapshots={}
+        while active:
+            cutoff=min(row[1]['next_cutoff'] for row in active)
+            batch=[]
+            for row in active:
+                if row[1]['next_cutoff']!=cutoff:continue
+                step=next(row[0]);row[1]=step;batch.append(step)
+                for item in step['items']:
+                    f=step['features'].get(item['unit'])
+                    if f is not None:snapshots[(item['experiment'],item['unit'])]=f
+            if report:report.safely('select_items',all_items,progress)
+            for session in sessions:
+                frames={item['unit']:snapshots[(item['experiment'],item['unit'])]
+                    for item in session.items if (item['experiment'],item['unit']) in snapshots}
+                with progress.stage(f'Риск · {cutoff:%Y-%m} · общий месячный шаг'):
+                    risk_status,risk_timeline=session.step(cutoff,cutoff+pd.offsets.MonthBegin(1),frames,progress)
+                for item in session.items:
+                    risk_rows=[r for r in risk_rows if not (r['experiment']==item['experiment'] and r['unit']==item['unit'])]
+                    risk_rows.extend(dict(experiment=item['experiment'],unit=item['unit'],head=head,**status)
+                                     for head,status in risk_status.items())
+                    if report:report.safely('set_monthly_risk',item,risk_status,risk_timeline.get(item['unit']))
+            pd.DataFrame(risk_rows).to_csv(root/'risk_status.csv',index=False,encoding='utf-8-sig')
+            ready=[]
+            from .risk_reporting import readiness_rows
+            by_item={}
+            for row in risk_rows:by_item.setdefault((row['experiment'],row['unit']),{})[row['head']]=row
+            for (experiment,unit),heads in by_item.items():
+                table=readiness_rows(heads,cfg)
+                if len(table):
+                    table.insert(0,'котёл',unit);table.insert(0,'эксперимент',experiment);ready.append(table)
+            if ready:pd.concat(ready,ignore_index=True).to_csv(root/'classifier_readiness.csv',index=False,encoding='utf-8-sig')
+            for step in batch:
+                if report:
+                    with progress.stage(f'{step["name"]} · {cutoff:%Y-%m} · график с риском'):
+                        report.safely('month',step['name'],step['spec'],step['number'],step['pieces'],step['selected'],progress)
+            complete=[row for row in active if row[1]['next_cutoff'] is None]
+            for row in complete:
+                progress.view=general_view
+                if report:report.safely('select_items',row[1]['items'],progress)
+                assert next(row[0],None) is None
+                active.remove(row)
     pd.DataFrame(statuses).to_csv(root/'status.csv', index=False, encoding='utf-8-sig')
     from .comparison import common_comparison
     progress.view=general_view
     with progress.stage('итоговое сравнение на общих часах'):
         common_comparison(root,contexts,cfg)
     progress.say('Расчёт завершён. Список готовых моделей: '+str((root/'models.csv').resolve()),status='complete')
-    return dict(summary=pd.DataFrame(summaries), status=pd.DataFrame(statuses))
+    return dict(summary=pd.DataFrame(summaries), status=pd.DataFrame(statuses), interpretation=pd.DataFrame(risk_rows))
 
 
 def period_metrics(timeline,events,cfg,first,experiment,unit,view,budget,policy):

@@ -51,6 +51,8 @@ def regressor_importance(model):
 
 def save_tables(table,folder,previous=None):
     folder=Path(folder);folder.mkdir(parents=True,exist_ok=True)
+    table=table.copy()
+    table['importance_percent']=pd.to_numeric(table['importance_percent'],errors='coerce')
     table=table.sort_values(['target','importance_percent','feature'],ascending=[True,False,True],kind='stable')
     available=table.loc[table.status.eq('available')]
     targets=available.target.nunique()
@@ -59,7 +61,8 @@ def save_tables(table,folder,previous=None):
     summary=summary.sort_values(['mean_importance_percent','feature'],ascending=[False,True],kind='stable')
     delta=table.loc[table.status.eq('available'),['target','feature','importance_percent']].copy()
     if previous and (Path(previous)/'feature_importance.csv').exists():
-        old=pd.read_csv(Path(previous)/'feature_importance.csv')
+        old=pd.read_csv(Path(previous)/'feature_importance.csv',dtype={'target':'string','feature':'string'},keep_default_na=False)
+        old['importance_percent']=pd.to_numeric(old['importance_percent'],errors='coerce')
         old=old.loc[old.status.eq('available'),['target','feature','importance_percent']].rename(columns={'importance_percent':'previous_percent'})
         delta=delta.merge(old,on=['target','feature'],how='outer')
         # A new/removed input is explicit; absence of an entire target model is

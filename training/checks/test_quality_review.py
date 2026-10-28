@@ -276,7 +276,7 @@ class QualityReviewTests(unittest.TestCase):
             with patch('notebook_reports.experiment_directories',return_value=items),patch('notebook_reports.show_table'),patch(
                 'interpretation_training.train_risk_group',return_value={'risk_24h':{'status':'no_observed_labelled_examples'}}) as group,patch(
                 'interpretation_training.train',return_value={'cause':{'status':'requires_reviewed_episode_labels'}}):
-                run_interpretation(cfg,contexts,attach=False)
+                run_interpretation(cfg,contexts,attach=False,reuse_monthly=False)
             self.assertEqual(group.call_args.args[3],contexts['B']['frame'].index[-1])
 
     def test_moving_results_does_not_change_group_head_identity(self):

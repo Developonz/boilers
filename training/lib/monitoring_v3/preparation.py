@@ -165,7 +165,7 @@ class FrozenEncoder:
 
     @classmethod
     def fit(cls, frame):
-        cat = {c: sorted(frame[c].fillna('__MISSING__').astype(str).unique())
+        cat = {c: sorted(frame[c].astype('string').fillna('__MISSING__').astype(str).unique())
                for c in frame if not pd.api.types.is_numeric_dtype(frame[c])}
         numeric = frame.drop(columns=list(cat)).astype(float)
         q = numeric.quantile([.25, .5, .75])
@@ -176,7 +176,7 @@ class FrozenEncoder:
         columns={}
         for c in self.columns:
             values=frame[c] if c in frame else pd.Series(np.nan,index=frame.index)
-            columns[c] = (values.fillna('__MISSING__').astype(str) if c in self.categories else
+            columns[c] = (values.astype('string').fillna('__MISSING__').astype(str) if c in self.categories else
                           pd.to_numeric(values, errors='coerce').replace([np.inf, -np.inf], np.nan))
         return pd.DataFrame(columns,index=frame.index)
 

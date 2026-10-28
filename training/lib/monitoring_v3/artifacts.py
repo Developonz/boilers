@@ -72,4 +72,4 @@ def record_export(root, name, unit, spec, state, month, current, history):
              model_dir=str(Path(current).resolve()),history_dir=str(Path(history).resolve()),status='ready')
     frame=pd.concat([frame,pd.DataFrame([row])],ignore_index=True)
     temporary=path.with_suffix('.csv.tmp');frame.to_csv(temporary,index=False,encoding='utf-8-sig')
-    os.replace(temporary,path)
+    _file_operation(lambda:os.replace(temporary,path))

@@ -10,7 +10,7 @@ import pandas as pd
 from .progress_display import NotebookDisplay,notebook_display
 
 _report=ContextVar('live_training_report',default=None)
-DEFAULT_OPTIONS=dict(enabled=True,update_every_months=1,risk_history=True,
+DEFAULT_OPTIONS=dict(enabled=True,update_every_months=1,show_risk=True,
                      view='mean::instant',budget=None,start=None,end=None)
 
 
@@ -32,6 +32,7 @@ class Panel:
         self.context=({'regime':context['regime'][['mode']],'events':context['events']}
                       if 'regime' in context and 'events' in context else context)
         self.timeline=None;self.risk=None;self.statuses={};self.done=0;self.total=0
+        self.risk_rows=None
         self.view=None;self.chart=None;self.table=None;self.snapshot={}
         if notebook_display() is not None:
             from IPython.display import HTML,display
@@ -52,7 +53,7 @@ class Panel:
         import matplotlib.pyplot as plt
         options=self.report.options
         figure,table=plot_training_timeline(self.timeline,self.context,self.report.cfg,self.title,
-            self.risk,self.statuses,view=options['view'],start=options['start'],end=options['end'])
+            self.risk if options['show_risk'] else None,self.statuses,view=options['view'],start=options['start'],end=options['end'])
         buffer=BytesIO()
         try:
             figure.savefig(buffer,format='png',dpi=105,bbox_inches='tight')
@@ -62,11 +63,16 @@ class Panel:
             if self.chart:self.chart.update(Image(data=buffer.getvalue()))
             from .risk_reporting import readiness_rows
             ready=readiness_rows(self.statuses,self.report.cfg)
-            content=('<p><b>Исторический риск:</b> отдельные модели на начало каждого месяца. '
+            content=('<p><b>Помесячный риск:</b> продолжение классификаторов в общем цикле на начало месяца. '
                 'Максимум внутри тревоги — последующее развитие, не прогноз при её начале.</p>'
                 if self.risk is not None else '<p>Исторический риск пока не рассчитан. «Нет оценки» не означает низкий риск.</p>')
-            if not options['risk_history']:content='<p>Исторические подписи риска выключены в LIVE.risk_history. Итоговые головы показаны ниже.</p>'
-            if len(ready):content+='<details open><summary>Готовность итоговых классификаторов</summary>'+ready.to_html(index=False,escape=True)+'</details>'
+            if not options['show_risk']:content='<p>Подписи скрыты в LIVE.show_risk; классификаторы продолжают обучаться помесячно.</p>'
+            if len(ready):content+='<details open><summary>Готовность классификаторов на текущий месяц</summary>'+ready.to_html(index=False,escape=True)+'</details>'
+            metrics_path=self.directory/'risk_metrics.csv'
+            if metrics_path.exists() and metrics_path.stat().st_size>4:
+                try:metrics=pd.read_csv(metrics_path)
+                except pd.errors.EmptyDataError:metrics=pd.DataFrame()
+                if len(metrics):content+='<details><summary>Precision риска: прошлые помесячные прогнозы с уже известным исходом</summary>'+metrics.to_html(index=False,escape=True,na_rep='—')+'</details>'
             content+='<details><summary>Все тревоги и результаты риска</summary>'+table.to_html(index=False,escape=True,na_rep='—')+'</details>'
             if self.table:self.table.update(HTML(content))
         finally:plt.close(figure)
@@ -80,10 +86,12 @@ class Fanout:
 
 class LiveTrainingReport:
     def __init__(self,cfg,options=None):
-        self.cfg=cfg;self.options={**DEFAULT_OPTIONS,**(options or {})};self.panels={};self.warnings=[]
+        options=dict(options or {})
+        if 'risk_history' in options:options.setdefault('show_risk',options.pop('risk_history'))
+        self.cfg=cfg;self.options={**DEFAULT_OPTIONS,**options};self.panels={};self.warnings=[]
         unknown=set(self.options)-set(DEFAULT_OPTIONS)
         if unknown:raise ValueError('Неизвестные настройки LIVE: '+str(sorted(unknown)))
-        for key in ('enabled','risk_history'):
+        for key in ('enabled','show_risk'):
             if not isinstance(self.options[key],bool):raise ValueError('LIVE.'+key+' должен быть bool')
         interval=self.options['update_every_months']
         if isinstance(interval,bool) or not isinstance(interval,int) or interval<1:raise ValueError('LIVE.update_every_months должен быть целым >= 1')
@@ -141,6 +149,7 @@ class LiveTrainingReport:
                 d['active']=stream.active;d['notification']=stream.notification
                 d['eligible']=contexts[unit]['eligible'].reindex(ix).fillna(False)
                 d['background_eligible']=contexts[unit]['frame']['Состояние'].reindex(ix).eq('Работа')
+                d['load_observed']=contexts[unit]['cleaned'][contexts[unit]['load']].reindex(ix).notna()
                 panel.timeline=d
                 if number%self.options['update_every_months']==0 or number==panel.total:panel.draw()
         progress.set_detail(progress.detail)
@@ -148,12 +157,16 @@ class LiveTrainingReport:
     def finish(self,name,spec,progress,available=True):
         for unit in spec['recipients']:
             p=self.panels[(name,unit)];p.done=p.total
-            label='Детектор рассчитан; риск ожидает интерпретации' if available else 'Модель не построена: недостаточно пригодной истории'
+            label='Месячный расчёт завершён; готовность риска — в таблице' if available else 'Модель не построена: недостаточно пригодной истории'
             p.update(dict(p.snapshot,phase=label,status='finished'),force=True)
 
     def select_items(self,items,progress):
         panels=[self.panels[(i['experiment'],i['unit'])] for i in items if (i['experiment'],i['unit']) in self.panels]
         self.bind(progress,panels)
+
+    def set_monthly_risk(self,item,statuses,risk):
+        panel=self.panels.get((item['experiment'],item['unit']))
+        if panel is not None:panel.statuses=statuses;panel.risk=risk
 
     def risk(self,item,statuses,risk,context=None):
         panel=self.panels.get((item['experiment'],item['unit']))
@@ -166,3 +179,7 @@ class LiveTrainingReport:
             panel.timeline=pd.read_parquet(path);self.panels[(item['experiment'],item['unit'])]=panel
         panel.risk=risk;panel.statuses=statuses;panel.draw()
         panel.update(dict(panel.snapshot,phase='Детектор и интерпретация завершены',status='finished'),force=True)
+
+
+# Compatibility with notebooks that used the short class name.
+LiveReport=LiveTrainingReport

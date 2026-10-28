@@ -42,7 +42,7 @@ def balanced_rows(features, limit):
     # pooled columns must not accidentally balance on a temperature instead.
     load=features.attrs.get('load_column')
     if load in numeric:numeric=[load]+[c for c in numeric if c!=load]
-    strata = features[cats].fillna('__MISSING__').astype(str).agg('|'.join, axis=1) if cats else pd.Series('', index=features.index)
+    strata = features[cats].astype('string').fillna('__MISSING__').astype(str).agg('|'.join, axis=1) if cats else pd.Series('', index=features.index)
     if numeric:
         x = pd.to_numeric(features[numeric[0]], errors='coerce')
         bins = pd.qcut(x, min(10, max(1, x.nunique())), duplicates='drop').astype(str) if x.nunique() > 1 else pd.Series('0', index=x.index)
@@ -65,8 +65,8 @@ def operating_support(model,features):
     if memory is None or not len(memory):return pd.DataFrame(dict(regime_seen=False,load_extrapolation=True),index=features.index)
     cats=[c for c in memory if c in features and not pd.api.types.is_numeric_dtype(memory[c])]
     if cats:
-        known=memory[cats].fillna('__MISSING__').astype(str).agg('|'.join,axis=1)
-        query=features[cats].fillna('__MISSING__').astype(str).agg('|'.join,axis=1)
+        known=memory[cats].astype('string').fillna('__MISSING__').astype(str).agg('|'.join,axis=1)
+        query=features[cats].astype('string').fillna('__MISSING__').astype(str).agg('|'.join,axis=1)
         seen=query.isin(set(known))
     else:seen=pd.Series(True,index=features.index)
     load=features.attrs.get('load_column')

@@ -14,6 +14,7 @@ CONTRACT=3
 
 
 def probabilities(package,features,require_calibration=False,threads=None):
+    if threads is None:threads=package.get('threads')
     options={'thread_count':threads} if threads is not None else {}
     raw=np.asarray(package['model'].predict_proba(package['encoder'].native(features),**options))
     calibrator=package.get('calibrator')
@@ -141,7 +142,7 @@ def _model(cfg,iterations):
         has_time=True,allow_writing_files=False,verbose=False)
 
 
-def _metrics(y,p,classes):
+def _metrics(y,p,classes,threshold=.7):
     from sklearn.metrics import log_loss,average_precision_score,brier_score_loss
     if not len(y):return dict(status='no_test_rows')
     labels=y.astype(str)
@@ -150,6 +151,11 @@ def _metrics(y,p,classes):
     result['logloss']=float(log_loss(labels,p,labels=classes))
     if '1.0' in classes:
         score=p[:,classes.index('1.0')];target=labels.eq('1.0')
+        predicted=score>=threshold
+        tp=int((predicted&target.to_numpy()).sum());fp=int((predicted&~target.to_numpy()).sum())
+        fn=int((~predicted&target.to_numpy()).sum())
+        result.update(precision=tp/(tp+fp) if tp+fp else None,recall=tp/(tp+fn) if tp+fn else None,
+                      true_positives=tp,false_positives=fp,false_negatives=fn,decision_threshold=threshold)
         result['brier']=float(brier_score_loss(target,score))
         result['average_precision']=float(average_precision_score(target,score)) if target.nunique()==2 else None
         result['recall_evaluable']=bool(target.any())
@@ -183,8 +189,8 @@ def _temporal_check(x,y,g,available,train,test,deadline,cfg):
     try:
         model=_model(cfg,cfg['cb_initial_trees'])
         model.fit(native,y.loc[selected].astype(str),cat_features=list(enc.categories),sample_weight=_weights(y.loc[selected],g.loc[selected]))
-        p=model.predict_proba(enc.native(x.loc[test]))
-        return dict(detail,**_metrics(y.loc[test],p,list(model.classes_)))
+        p=model.predict_proba(enc.native(x.loc[test]),thread_count=cfg['threads'])
+        return dict(detail,**_metrics(y.loc[test],p,list(model.classes_),cfg['risk_policy']['confidence']))
     except Exception as exc:
         return dict(detail,status='evaluation_failed',problem=type(exc).__name__+': '+str(exc))
 
@@ -260,6 +266,7 @@ def _train_classifier(features,labels,groups,cfg,dest,previous=None,*,horizon_ho
         report['fit_status']='tree_capacity_reached_previous_retained'
     else:
         xf,yf,gf=x.loc[fit],y.loc[fit].astype(str),g.loc[fit]
+        report['fit_status']='initial' if previous is None else 'incremental'
         if previous:
             replay=previous['replay'];xf=pd.concat([replay[0],xf]).sort_index()
             yf=pd.concat([replay[1],yf]).reindex(xf.index)
@@ -274,7 +281,7 @@ def _train_classifier(features,labels,groups,cfg,dest,previous=None,*,horizon_ho
     calibrator=None
     cal_groups={c:g.loc[cal & y.astype(str).eq(c)].nunique() for c in classes}
     if all(cal_groups[c]>=policy['min_calibration_groups'] for c in classes) and set(y.loc[cal].astype(str))==set(classes):
-        raw=np.log(np.clip(model.predict_proba(encoder.native(x.loc[cal])),1e-9,1.))
+        raw=np.log(np.clip(model.predict_proba(encoder.native(x.loc[cal]),thread_count=cfg['threads']),1e-9,1.))
         # Group reservation is stratified. Correct its class prior back to the
         # observed decision-point prevalence; never balance calibration classes.
         priors=y.astype(str).value_counts()/y.loc[cal].astype(str).value_counts()
@@ -287,11 +294,12 @@ def _train_classifier(features,labels,groups,cfg,dest,previous=None,*,horizon_ho
         report['probability_status']='uncalibrated_score_only'
         report['calibration_groups_by_class']={c:int(v) for c,v in cal_groups.items()}
     actual_fit=fit|ids.isin(previous.get('ingested',()) if previous else ()).to_numpy()
+    report.update(trees=int(model.tree_count_),new_training_rows=int(fit.sum()))
     report['partitions']['deployment_train']=_describe(x,y,g,actual_fit)
     report['pending_training_rows']=int((tr&~actual_fit).sum())
     through=_time(x.loc[fit]).max() if fit.any() else pd.Timestamp(previous['trained_through'])
     if previous:through=max(through,pd.Timestamp(previous['trained_through']))
-    package=dict(contract=CONTRACT,feature_contract=signature,model=model,encoder=encoder,
+    package=dict(contract=CONTRACT,feature_contract=signature,model=model,encoder=encoder,threads=cfg['threads'],
         calibration_group_ids=sorted(reserved),trained_group_ids=sorted(set(g.loc[fit])|set(previous.get('trained_group_ids',()) if previous else ())),
         row_fingerprints={**(previous.get('row_fingerprints',{}) if previous else {}),
                           **{str(idx):row_hash[str(idx)] for idx in x.index[fit]}},

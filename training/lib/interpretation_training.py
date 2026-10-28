@@ -57,12 +57,12 @@ def train(cfg, directory, unit, as_of, attach=False, features_path=None, context
     return statuses
 
 
-def attach_heads(directory,statuses,as_of):
+def attach_heads(directory,statuses,as_of,exported=None):
     import joblib,hashlib,shutil,uuid,tempfile
     from monitoring_v3.artifacts import publish_export
     from monitoring_v3.checkpoint_cache import STATE_CONTRACT
     from monitoring_v3.classification import CONTRACT
-    exported=Path(directory)/'model'
+    exported=Path(exported) if exported is not None else Path(directory)/'model'
     if not exported.is_dir():raise ValueError('No export to attach interpretation to')
     if not any(s.get('status') in ('trained','trained_uncalibrated') for s in statuses.values()) and not (
         (exported/'interpreter.joblib').exists() or any(exported.glob('risk_*h.joblib'))):
@@ -89,12 +89,13 @@ def attach_heads(directory,statuses,as_of):
                     history=Path(directory)/'interpretation_export_history';history.mkdir(exist_ok=True)
                     shutil.copy2(file,history/(uuid.uuid4().hex+'__'+file.name));file.unlink()
                 continue
-            head['available_at']=str(as_of);joblib.dump(head,target)
+            available_at=status.get('available_at',as_of)
+            head['available_at']=str(available_at);joblib.dump(head,target)
             source_importance=source.parent/'feature_importance.csv'
             if importance_target.exists():importance_target.unlink()
             if source_importance.exists():shutil.copy2(source_importance,importance_target)
             status['export_attachment']='attached'
-            attached.append(dict(kind=kind,available_at=str(as_of),probability_status=head.get('report',{}).get('probability_status'),
+            attached.append(dict(kind=kind,available_at=str(available_at),probability_status=head.get('report',{}).get('probability_status'),
                 samples=head.get('risk_policy',{}).get('samples')))
         if metadata:
             metadata['interpretation_heads']=attached
