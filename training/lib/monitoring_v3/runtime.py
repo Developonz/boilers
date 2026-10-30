@@ -26,6 +26,21 @@ def export(state, context, spec, cfg, folder, fingerprint=None,importance_dir=No
                    declared_units=context.get('declared_units',{}),
                    source_load_name=next((r['original'] for r in context.get('original_roles',[]) if r['role']=='load'),context['load']))
     joblib.dump(package, folder/'state.joblib', compress=3)
+    model=state['model']
+    if getattr(model,'sensor_input_mode',None) in ('all_other','all'):
+        mode=model.sensor_input_mode
+        (folder/'sensor_inputs.json').write_text(json.dumps(dict(mode=mode,targets=model.targets,
+            exclude_self=mode=='all_other',linear_baseline=model.kernel.lin is not None,
+            full_memory=bool(getattr(model.kernel,'full_memory',False)),conditions=model.encoder.columns,
+            complete_vectors_only=True,missing_query='no_estimate',
+            solver='pseudoinverse' if model.method=='MSET' else 'kernel_average',
+            ridge=0.0 if model.method=='MSET' else None,pinv_rtol=1e-10 if model.method=='MSET' else None),ensure_ascii=False,indent=2),encoding='utf-8')
+        pd.DataFrame(model.related_diagnostics).to_csv(folder/'related_inputs.csv',index=False,encoding='utf-8-sig')
+    if hasattr(model,'related'):
+        (folder/'related_inputs.json').write_text(json.dumps(model.related,ensure_ascii=False,indent=2),encoding='utf-8')
+        pd.DataFrame(getattr(model,'related_diagnostics',[])).to_csv(folder/'related_inputs.csv',index=False,encoding='utf-8-sig')
+    if hasattr(model,'target_availability'):
+        pd.DataFrame(model.target_availability()).to_csv(folder/'target_availability.csv',index=False,encoding='utf-8-sig')
     if importance_dir:
         for file in Path(importance_dir).glob('feature_importance*.csv'):shutil.copy2(file,folder/file.name)
     code = folder/'monitoring_v3'; code.mkdir(exist_ok=True)
@@ -171,7 +186,7 @@ class Model:
                                  'часов':float((e.end-e.confirmed)/pd.Timedelta('1h')), 'пик':e.peak,
                                  'главные датчики':'', 'первое превышение':e.start})
         from .pipeline import dataset
-        f,y = dataset(context, self.spec['variant'], self.spec['horizon'], self.config)
+        f,y = dataset(context, self.spec['variant'], self.spec['horizon'], self.config,method=self.spec['method'])
         from .risk_dataset import alarm_features
         primary,_=alarm_stream(views['mean::instant'].ratio,self.config)
         features=alarm_features(features,primary,self.config).drop(columns=['episode_group'],errors='ignore')

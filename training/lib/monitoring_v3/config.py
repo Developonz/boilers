@@ -23,6 +23,7 @@ DEFAULTS = dict(
     max_background_fraction=.05, pre_window_days=7, neutral_days=7, min_lead_hours=3,
     validation_tolerance=.25, validate_rows=168, validate_candidate=True, schema_version=1,
     scenarios=['local'], related_inputs={}, risk_horizons=[24, 168],
+    related_policy=dict(mode='auto', max_inputs=6, min_abs_correlation=.2, sample_rows=5000),
     history_policy=dict(block_hours=168, calibration_every=3, validation_every=9,
                         bootstrap=True, reference_days=60),
     regime_policy=dict(stop_hours=2, off_fraction=.9, current_fraction=.15,
@@ -41,7 +42,7 @@ def load(path=None, overrides=None):
         cfg.update(json.loads(Path(path).read_text(encoding='utf-8')))
     if overrides:
         cfg.update(overrides)
-    for key in ('history_policy','regime_policy','risk_policy'):
+    for key in ('history_policy','regime_policy','risk_policy','related_policy'):
         if not isinstance(cfg[key],dict):raise ValueError(key+' must be a dictionary')
         extra=set(cfg[key])-set(DEFAULTS[key])
         if extra:raise ValueError(f'Unknown {key} keys: {sorted(extra)}')
@@ -49,7 +50,7 @@ def load(path=None, overrides=None):
     for key,default in DEFAULTS.items():
         if type(default) in (int,float) and (isinstance(cfg[key],bool) or not isinstance(cfg[key],Real) or not math.isfinite(cfg[key])):
             raise ValueError(key+' must be a finite number')
-    for policy in ('history_policy','regime_policy','risk_policy'):
+    for policy in ('history_policy','regime_policy','risk_policy','related_policy'):
         for key,default in DEFAULTS[policy].items():
             value=cfg[policy][key]
             if type(default) in (int,float) and (isinstance(value,bool) or not isinstance(value,Real) or not math.isfinite(value)):
@@ -68,6 +69,17 @@ def load(path=None, overrides=None):
         raise ValueError(f'Unknown configuration keys: {sorted(unknown)}')
     if not isinstance(cfg['validate_candidate'],bool):
         raise ValueError('validate_candidate must be True or False')
+    related=cfg['related_policy']
+    if related['mode'] not in ('auto','manual') or not 0<=related['min_abs_correlation']<=1:
+        raise ValueError('Invalid related_policy mode/correlation')
+    for key in ('max_inputs','sample_rows'):
+        value=related[key]
+        if isinstance(value,bool) or int(value)!=value or value<=0:
+            raise ValueError('related_policy.'+key+' must be a positive integer')
+        related[key]=int(value)
+    if not isinstance(cfg['related_inputs'],dict) or any(
+        not isinstance(v,list) or any(not isinstance(c,str) for c in v) for v in cfg['related_inputs'].values()):
+        raise ValueError('related_inputs must map target names to lists of sensor names')
     step=pd.Timedelta(cfg['step'])
     if not pd.Timedelta(0)<step<=pd.Timedelta('1h') or pd.Timedelta('1h')%step!=pd.Timedelta(0):
         raise ValueError('step must divide one hour and be at most one hour')

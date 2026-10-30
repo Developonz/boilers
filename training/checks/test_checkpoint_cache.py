@@ -93,7 +93,9 @@ class CheckpointCacheTests(unittest.TestCase):
             paths=list(Path(cfg['output']).glob('experiments/*/checkpoints/*.joblib'))
             original={p:p.read_bytes() for p in paths};changed=dict(cfg,cb_depth=cfg['cb_depth']+1)
             with patch('monitoring_v3.pipeline.update_at',side_effect=RuntimeError('rebuild interrupted')):
-                with self.assertRaisesRegex(RuntimeError,'rebuild interrupted'):run(changed)
+                failed=run(changed)
+            self.assertTrue(failed['status'].status.eq('failed').all())
+            self.assertTrue(failed['status'].reason.str.contains('rebuild interrupted').all())
             self.assertTrue(all(p.read_bytes()==data for p,data in original.items()))
             result=run(changed)
             self.assertTrue(result['status'].status.eq('complete').all())

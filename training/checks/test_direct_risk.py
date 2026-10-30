@@ -14,7 +14,8 @@ sys.path[:0]=[str(ROOT/'lib')]
 from monitoring_v3.config import load
 from monitoring_v3.data import prepare_unit
 from direct_risk import (direct_options,direct_features,direct_dataset,direct_split,
-    direct_balance,direct_fit,direct_predict,direct_event_report,direct_threshold)
+    direct_balance,direct_fit,direct_predict,direct_event_report,direct_threshold,
+    direct_thresholds,direct_report_html,direct_nonzero_importance)
 
 
 def context(rows=120,failures=()):
@@ -81,7 +82,7 @@ class DirectRiskTests(unittest.TestCase):
 
     def test_split_purges_known_future_and_groups_and_balances_only_train(self):
         c,cfg=context(24*320,failures=[24*d for d in (50,100,150,200,250,300)])
-        options=direct_options();x,m,s,a=direct_dataset({'К-1':c},cfg,options)
+        options=direct_options({'balance_train':True,'event_weights':True});x,m,s,a=direct_dataset({'К-1':c},cfg,options)
         masks,summary,boundaries=direct_split(m,options)
         groups={name:set(m.loc[mask,'label_group']) for name,mask in masks.items()}
         self.assertFalse(groups['train']&groups['validation'])
@@ -103,6 +104,25 @@ class DirectRiskTests(unittest.TestCase):
         threshold,table,status=direct_threshold(y,scores,direct_options())
         self.assertEqual(threshold,.08)
         self.assertIn('validation',status)
+
+    def test_default_keeps_natural_proportions_and_unit_weights(self):
+        ix=pd.MultiIndex.from_arrays([pd.date_range('2024-01-01',periods=100,freq='h'),['K']*100],names=['time','unit'])
+        meta=pd.DataFrame({'label':[1.]*2+[0.]*98,'label_group':['event']*2+['week']*98},index=ix)
+        selected,weights,summary=direct_balance(meta,pd.Series(True,index=ix),direct_options())
+        self.assertFalse(direct_options()['balance_train'])
+        self.assertEqual(len(selected),17)
+        np.testing.assert_array_equal(weights,np.ones(17))
+        self.assertNotEqual(summary.rows.iloc[0],summary.rows.iloc[1])
+
+    def test_four_validation_thresholds_include_precision_oriented_f05(self):
+        y=pd.Series([1,0,0,1,0,1,0,0]);scores=np.array([.9,.8,.7,.6,.5,.4,.3,.2])
+        _,table,_=direct_threshold(y,scores,direct_options())
+        rules,curve=direct_thresholds({'threshold_table':table})
+        self.assertEqual(set(rules),{'default_05','best_f1','best_f2','best_f05'})
+        self.assertEqual(rules['best_f05']['threshold'],.9)
+        self.assertEqual(rules['best_f2']['threshold'],.4)
+        for key in ('best_f1','best_f2','best_f05'):
+            self.assertTrue(rules[key]['status'].startswith('validation_'))
 
     def test_entire_pre_failure_week_is_positive_and_unknown_tail_is_not_negative(self):
         c,cfg=context(500,failures=[250]);options=direct_options()
@@ -126,7 +146,7 @@ class DirectRiskTests(unittest.TestCase):
             package,masks,summary,balanced=direct_fit(x,m,s,options,folder,verbose=False)
             self.assertTrue((Path(folder)/'classifier.cbm').exists())
             self.assertTrue((Path(folder)/'test_predictions.parquet').exists())
-            self.assertEqual(len(package['metrics']),5)
+            self.assertEqual(len(package['metrics']),2*len(package['thresholds'])+3)
             tested=package['predictions'].loc[lambda d:d.evaluation_eligible]
             predicted=direct_predict(package,x.loc[tested.index])
             np.testing.assert_allclose(predicted.score,tested.score)
@@ -134,6 +154,17 @@ class DirectRiskTests(unittest.TestCase):
             with patch('catboost.CatBoostClassifier.fit',side_effect=AssertionError('must restore')):
                 restored,_,_,_=direct_fit(x,m,s,options,folder,verbose=False)
             self.assertEqual(package['fingerprint'],restored['fingerprint'])
+            package['importance']=pd.concat([package['importance'],pd.DataFrame([{'feature':'must_hide_zero','importance':0.}])],ignore_index=True)
+            self.assertNotIn('must_hide_zero',direct_nonzero_importance(package).feature.to_list())
+            html,summary=direct_report_html(package,{'К-1':c},folder,'test')
+            self.assertIn('<details class="direct-boiler">',html)
+            self.assertIn('data:image/png;base64,',html)
+            self.assertEqual(html.count('f1-score'),len(package['thresholds']))
+            self.assertNotIn('must_hide_zero',html)
+            self.assertNotIn('Figure(',html)
+            self.assertIn('Обучение без балансировки',html)
+            self.assertEqual(len(summary),len(package['thresholds'])+3)
+            self.assertEqual(len(list(Path(folder).glob('*_confusion.png'))),len(package['thresholds']))
 
 
 if __name__=='__main__':unittest.main()

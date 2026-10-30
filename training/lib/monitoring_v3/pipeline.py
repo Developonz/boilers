@@ -5,19 +5,20 @@ import hashlib
 import json
 import os
 import sys
+import traceback
 import importlib.metadata
 import joblib
 import numpy as np
 import pandas as pd
 from .config import load
 from .data import load_sources, healthy, read_rules
-from .models import NormalModel, RelatedModel, AnalogCorrection, MultiTargetModel, balanced_rows, snapshot_model,operating_support
+from .models import NormalModel, RelatedModel, RelatedKernelModel, AnalogCorrection, MultiTargetModel, balanced_rows, snapshot_model,operating_support
 from .alarm_scores import sensor_scale, score_views, calibrate_threshold, alarm_stream, evaluate,view_policy
 from .progress import Progress
 from .artifacts import export_ready, publish_export, record_export
 from .threads import numerical_threads
 from .target_training import initial_targets
-from .checkpoint_cache import signatures,checkpoint_compatible,backup_checkpoint
+from .checkpoint_cache import signatures,checkpoint_compatible,backup_checkpoint,semantic_config
 from .partitioning import partition_history
 
 
@@ -30,10 +31,11 @@ def atomic_dump(value, path):
 
 def write_update_reports(dest,rows):
     pd.DataFrame(rows).to_json(dest/'updates.json',orient='records',indent=2,force_ascii=False,date_format='iso')
-    calibration=[];targets=[];sensor_calibration=[];admission=[]
+    calibration=[];targets=[];sensor_calibration=[];admission=[];vectors=[]
     for row in rows:
         admission.extend(dict(month=row.get('cutoff'),unit=unit,status=row.get('status'),**values)
             for unit,values in row.get('admission_by_unit',{}).items())
+        vectors.extend(dict(month=row.get('cutoff'),**item) for item in row.get('complete_vector_missingness',[]))
         for unit,views in row.get('calibration_by_unit',{}).items():
             for view,budgets in views.items():
                 for budget,details in budgets.items():
@@ -46,13 +48,17 @@ def write_update_reports(dest,rows):
     pd.DataFrame(targets).to_csv(dest/'target_update_diagnostics.csv',index=False,encoding='utf-8-sig')
     pd.DataFrame(sensor_calibration).to_csv(dest/'calibration_sensor_diagnostics.csv',index=False,encoding='utf-8-sig')
     pd.DataFrame(admission).to_csv(dest/'admission_diagnostics.csv',index=False,encoding='utf-8-sig')
+    if vectors:pd.DataFrame(vectors).to_csv(dest/'complete_vector_missingness.csv',index=False,encoding='utf-8-sig')
 
 
-def dataset(context, variant, horizon, cfg):
+def dataset(context, variant, horizon, cfg, method=None):
     f = context['features'].copy()
     y = context['cleaned'][context['targets']].copy()
     eligible = context['eligible'].copy()
-    if variant == 'related':
+    if variant=='related' and method in ('AAKR','MSET'):
+        columns=[c for c,r in context['roles'].items() if r in ('load','condition','state')]
+        f=context['cleaned'][columns].copy()
+    elif variant == 'related':
         f=pd.concat([f,y.add_prefix('sensor::')],axis=1)
     elif variant == 'forecast':
         shift = max(1, int(round(pd.Timedelta(hours=horizon)/pd.Timedelta(cfg['step']))))
@@ -106,7 +112,9 @@ def experiments(cfg):
                     continue
                 for method in cfg['models']:
                     for variant in cfg['feature_sets']:
-                        if variant != 'conditions' and method != 'CatBoost':
+                        if variant == 'forecast' and method != 'CatBoost':
+                            continue
+                        if variant == 'related' and method not in ('CatBoost','AAKR','MSET'):
                             continue
                         for horizon in (cfg['horizons'] if variant == 'forecast' else [0]):
                             yield dict(group=group, scenario=scenario, sources=donors, recipients=targets,
@@ -158,9 +166,11 @@ def update_at(contexts, spec, cutoff, cfg, previous=None, progress=None):
     tag=f'{spec["method"]} · {"+".join(spec["sources"])} · {pd.Timestamp(cutoff):%Y-%m}'
     phase=lambda text:progress.stage(tag+' · '+text) if progress else nullcontext()
     fparts, yparts,admission = {}, {},{}
+    classical=spec['variant']=='related' and spec['method'] in ('AAKR','MSET')
+    vector_missingness=[]
     for u in spec['sources']:
         c = contexts[u]
-        f, y = dataset(c, spec['variant'], spec['horizon'], cfg)
+        f, y = dataset(c, spec['variant'], spec['horizon'], cfg,method=spec['method'])
         mask = healthy(c, cutoff, cfg) & y.notna().mean(axis=1).ge(cfg['minimum_coverage'])
         past=c['frame'].index<pd.Timestamp(cutoff)
         required=[name for name,role in c['roles'].items() if role in ('load','condition','state')]
@@ -168,6 +178,14 @@ def update_at(contexts, spec, cutoff, cfg, previous=None, progress=None):
             enough_target_rows=int((past&c['eligible']&y.notna().mean(axis=1).ge(cfg['minimum_coverage'])).sum()),
             missing_input_rows=int((past&c['eligible']&c['cleaned'][required].notna().mean(axis=1).lt(cfg['minimum_coverage'])).sum()),
             admitted_normal_rows=int(mask.sum()))
+        if classical:
+            complete=RelatedKernelModel.complete_vectors(f,y)
+            admission[u].update(complete_normal_rows=int((mask&complete).sum()),
+                                excluded_incomplete_normal_rows=int((mask&~complete).sum()))
+            for kind,values in [('input',RelatedKernelModel._conditions(f)),('target',y)]:
+                for sensor,count in values.loc[mask].isna().sum().items():
+                    if count:vector_missingness.append(dict(unit=u,sensor=sensor,role=kind,missing_rows=int(count)))
+            mask &= complete
         fparts[u], yparts[u] = f.loc[mask], y.loc[mask]
     f, y = _pooled(fparts), _pooled(yparts)
     original_previous=previous
@@ -187,12 +205,15 @@ def update_at(contexts, spec, cutoff, cfg, previous=None, progress=None):
     train,val,cal,reserved_cal,reserved_val,partition_audit=partition_history(f,cfg,original_previous)
     if train.sum()<cfg['min_train_rows'] or cal.sum()<cfg['calibration_rows']:
         reason='insufficient_training_data' if train.sum()<cfg['min_train_rows'] else 'insufficient_unseen_calibration'
+        if classical:reason='insufficient_complete_training_vectors' if train.sum()<cfg['min_train_rows'] else 'insufficient_complete_calibration_vectors'
         return unavailable(dict(status=reason,cutoff=str(cutoff),**partition_audit,
                          required_train=cfg['min_train_rows'],required_calibration=cfg['calibration_rows'],
+                         complete_vector_missingness=vector_missingness,
                          admission_by_unit=admission))
     cal_start=times[cal].min()
     if previous is None:
-        model = (RelatedModel(cfg, cfg['related_inputs']) if spec['variant'] == 'related' else
+        model = (RelatedKernelModel(spec['method'],cfg) if spec['variant']=='related' and spec['method'] in ('AAKR','MSET') else
+                 RelatedModel(cfg, cfg['related_inputs']) if spec['variant'] == 'related' else
                  AnalogCorrection(cfg) if spec['method'] == 'CatBoostCorrection' else
                  MultiTargetModel(spec['method'],cfg) if spec['method'] == 'CatBoostMulti' else NormalModel(spec['method'], cfg))
         with phase(f'первоначальное обучение: {int(train.sum())} строк, {len(y.columns)} целей'):
@@ -276,6 +297,7 @@ def update_at(contexts, spec, cutoff, cfg, previous=None, progress=None):
                  last_train_time=str(max(k[0] for k in ingested)),calibration_ready_units=ready,
                  validation_recent_rows=int(val.sum()),calibration_by_unit=thresholds,admission_by_unit=admission)
     audit['calibration_sensor_diagnostics']=all_errors.attrs.get('calibration_sensor_diagnostics',[])
+    if classical:audit['complete_vector_missingness']=vector_missingness
     audit['model_fitted_at']=str(cutoff) if previous is None or audit.get('accepted') else previous['audit'].get('model_fitted_at',str(previous['cutoff']))
     audit['calibration_last_time']=str(times[cal].max())
     frozen=original_previous.get('frozen') if original_previous else None
@@ -326,14 +348,14 @@ def calibration_errors(model,features,actual):
 
 
 def score_context(state, context, spec, cfg, return_expected=False,with_features=True):
-    f, y = dataset(context, spec['variant'], spec['horizon'], cfg)
+    f, y = dataset(context, spec['variant'], spec['horizon'], cfg,method=spec['method'])
     options={'diagnostic_start':context.get('diagnostic_start')} if type(state['model']) is NormalModel else {}
     med,spread=state['model'].expected(f,y,**options)
     inputs=[c for c,r in context['roles'].items() if r in ('load','condition','state')]
     input_coverage=context['cleaned'][inputs].notna().mean(axis=1) if inputs else pd.Series(0.,index=f.index)
     usable=context['eligible']&input_coverage.ge(cfg['minimum_coverage'])&(not state.get('unsafe_normal',False))
     e = y.reindex(columns=state['model'].targets).sub(med).div(spread).where(usable,np.nan)
-    re = e if state['reference'] is state['model'] else state['reference'].errors(f, y).where(usable, np.nan)
+    re = (e if state['reference'] is state['model'] else state['reference'].errors(f, y).where(usable, np.nan)) if with_features else None
     rare=state.get('event_sensors',[])
     changed=pd.DataFrame({c:context['changes'][c+'::changed'] for c in rare})
     views, matrices = score_views(e, state['scale'], cfg, state['groups'],rare,changed)
@@ -395,15 +417,32 @@ def score_fingerprint(context, end, model_token):
     return digest.hexdigest()
 
 
-def score_month(state, context, spec, cfg, cutoff, end):
+def score_month(state, context, spec, cfg, cutoff, end, with_features=True):
     c=scoring_context(context,spec,cfg,cutoff,end)
     c['diagnostic_start']=pd.Timestamp(cutoff)
-    views,_,errors,features,med,spread=score_context(state,c,spec,cfg,return_expected=True)
+    views,_,errors,features,med,spread=score_context(state,c,spec,cfg,return_expected=True,with_features=with_features)
     mask=(errors.index>=cutoff)&(errors.index<end)
     diagnostics=[]
     if hasattr(state['model'],'interval_diagnostics'):
         diagnostics=[dict(month=str(cutoff),model_cutoff=str(state['cutoff']),**row)
                      for row in med.attrs.get('prediction_diagnostics',[])]
+    # Physical-unit regression metrics are separate from normalized residuals.
+    # Sufficient statistics permit exact aggregation across monthly models.
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+    by_sensor={row['sensor']:row for row in diagnostics}
+    for sensor in med.columns:
+        actual=c['cleaned'][sensor].reindex(med.index).loc[mask]
+        predicted=med[sensor].loc[mask]
+        valid=errors[sensor].loc[mask].notna()&np.isfinite(actual)&np.isfinite(predicted)
+        a,p=actual.loc[valid].astype(float),predicted.loc[valid].astype(float)
+        if not len(a):continue
+        row=by_sensor.setdefault(sensor,dict(month=str(cutoff),model_cutoff=str(state['cutoff']),sensor=sensor))
+        row.update(regression_rows=len(a),mae=float(mean_absolute_error(a,p)),
+            rmse=float(np.sqrt(mean_squared_error(a,p))),
+            r2=float(r2_score(a,p)) if len(a)>1 and a.nunique()>1 else np.nan,
+            absolute_error_sum=float((a-p).abs().sum()),squared_error_sum=float(((a-p)**2).sum()),
+            target_sum=float(a.sum()),target_squared_sum=float((a*a).sum()))
+    diagnostics=list(by_sensor.values())
     thresholds=state['thresholds'].get(context['unit'])
     if thresholds is None:
         thresholds={view:{str(b):{'threshold':max(d[view][str(b)]['threshold']
@@ -429,10 +468,14 @@ def score_month(state, context, spec, cfg, cutoff, end):
                      if np.isfinite(d[view][str(budget)]['threshold'])),default=np.inf)
                 frame['threshold_budget_'+str(budget)]=threshold
             frozen[view]=frame
-    return dict(views=result,frozen_views=frozen,errors=errors.loc[mask],features=features.loc[mask],diagnostics=diagnostics)
+    predictions=med.loc[mask].copy();predictions.attrs={}
+    return dict(views=result,frozen_views=frozen,errors=errors.loc[mask],predictions=predictions,
+                features=features.loc[mask] if features is not None else None,diagnostics=diagnostics)
 
 
-def run(cfg,live_report=None,interpretation=None,live_options=None):
+def run(cfg,live_report=None,interpretation=None,live_options=None,train_classifiers=True):
+    """Run detectors; disable the classifier lifecycle explicitly for notebook 02."""
+    if not isinstance(train_classifiers,bool):raise ValueError('train_classifiers must be bool')
     cfg=load(overrides=cfg)
     # Large numbers of small BLAS solves can stall with an unrestricted thread
     # pool. Apply the configured limit to the entire numerical lifecycle.
@@ -440,13 +483,30 @@ def run(cfg,live_report=None,interpretation=None,live_options=None):
     if live_report is None and live_options is not None:
         from .notebook_live import LiveTrainingReport
         live_report=LiveTrainingReport(cfg,live_options)
-    with numerical_threads(cfg['threads']),report_scope(live_report):
-        result=_run(cfg,interpretation)
+    try:
+        with numerical_threads(cfg['threads']),report_scope(live_report):
+            result=_run(cfg,interpretation,train_classifiers=train_classifiers)
+    except BaseException as exc:
+        path=Path(cfg['output'])/'status.csv'
+        if path.exists():
+            status=pd.read_csv(path)
+            waiting=status.status.isin(['running','planned'])
+            status['reason']=status.get('reason',pd.Series('',index=status.index)).astype('string')
+            status.loc[waiting,'status']='interrupted' if isinstance(exc,KeyboardInterrupt) else 'aborted'
+            status.loc[waiting,'reason']=type(exc).__name__+': '+str(exc)
+            tmp=path.with_suffix('.csv.tmp');status.to_csv(tmp,index=False,encoding='utf-8-sig');os.replace(tmp,path)
+            for name,rows in status.groupby('experiment'):
+                dest=path.parent/'experiments'/name
+                if dest.is_dir():
+                    tmp=dest/'status.json.tmp'
+                    tmp.write_text(rows.to_json(orient='records',force_ascii=False,indent=2),encoding='utf-8')
+                    os.replace(tmp,dest/'status.json')
+        raise
     if live_report is not None:result['live_report']=live_report
     return result
 
 
-def _run(cfg,interpretation=None):
+def _run(cfg,interpretation=None,train_classifiers=True):
     root=Path(cfg['output']);root.mkdir(parents=True,exist_ok=True)
     progress=Progress(root)
     from .notebook_live import current_report
@@ -466,6 +526,23 @@ def _run(cfg,interpretation=None):
     specs=list(experiments(cfg))
     progress.say(f'Запланировано экспериментов: {len(specs)}. Модели сохраняются после каждого месячного среза.')
     summaries,statuses,frozen_summaries,period_summaries=[],[],[],[]
+    def experiment_name(spec):
+        return '__'.join([spec['group'],spec['scenario'],'+'.join(spec['sources']),spec['method'],spec['variant'],str(spec['horizon'])])
+    def write_status(**value):
+        name=value['experiment']
+        for row in statuses:
+            if row['experiment']==name and ('unit' not in value or row['unit']==value['unit']):
+                row.update(value)
+        path=root/'status.csv';tmp=path.with_suffix('.csv.tmp')
+        pd.DataFrame(statuses).to_csv(tmp,index=False,encoding='utf-8-sig');os.replace(tmp,path)
+        dest=root/'experiments'/name
+        if dest.is_dir():
+            tmp=dest/'status.json.tmp'
+            tmp.write_text(json.dumps([r for r in statuses if r['experiment']==name],ensure_ascii=False,indent=2,default=str),encoding='utf-8')
+            os.replace(tmp,dest/'status.json')
+    for spec in specs:
+        statuses.extend(dict(experiment=experiment_name(spec),unit=u,status='planned') for u in spec['recipients'])
+    if specs:write_status(experiment=experiment_name(specs[0]),status='planned')
     def _experiment(number,spec):
         progress.view=general_view
         name = '__'.join([spec['group'], spec['scenario'], '+'.join(spec['sources']), spec['method'], spec['variant'], str(spec['horizon'])])
@@ -477,8 +554,6 @@ def _run(cfg,interpretation=None):
         members = list(dict.fromkeys(spec['sources']+spec['recipients']))
         selected = align_contexts(contexts, members) if spec['scenario'] != 'local' else {u:contexts[u] for u in members}
         selected=transfer_preparation(selected,spec,cfg)
-        if spec['variant'] == 'related' and not all(cfg['related_inputs'].get(c) for c in next(iter(selected.values()))['targets']):
-            statuses.append(dict(experiment=name, status='requires_reviewed_related_inputs')); return
         first = pd.Timestamp(cfg['first_test'])
         # Recipients cannot cause models to be trained beyond donor observation time.
         source_end=(max if spec['scenario']=='pooled' else min)(selected[u]['frame'].index[-1] for u in spec['sources'])
@@ -499,6 +574,7 @@ def _run(cfg,interpretation=None):
         pieces = {u:{} for u in spec['recipients']}
         frozen_pieces={u:{} for u in spec['recipients']}
         error_parts, feature_parts, audit_rows = {u:[] for u in pieces}, {u:[] for u in pieces}, []
+        prediction_parts={u:[] for u in pieces}
         prediction_diagnostics={u:[] for u in pieces}
         for month_number,cutoff in enumerate(months,1):
             progress.view=general_view
@@ -534,6 +610,7 @@ def _run(cfg,interpretation=None):
                         atomic_dump(dict(fingerprint=token,compatibility=state_token,state=state), path)
             audit=dict(audit)
             audit_rows.append(audit)
+            write_status(experiment=name,status='running',cutoff=str(cutoff),model_status=audit['status'])
             progress.say(tag+' · модель: '+audit['status'],status=audit['status'])
             if state is None:
                 progress.say('Модель пока не получена: '+json.dumps(audit,ensure_ascii=False,default=str))
@@ -542,6 +619,10 @@ def _run(cfg,interpretation=None):
                     end=cutoff+pd.offsets.MonthBegin(1),next_cutoff=following,features={},
                     pieces=pieces,selected=selected,number=month_number)
                 continue
+            if hasattr(state['model'],'related_diagnostics'):
+                pd.DataFrame(state['model'].related_diagnostics).to_csv(dest/'related_inputs.csv',index=False,encoding='utf-8-sig')
+            if hasattr(state['model'],'target_availability'):
+                pd.DataFrame(state['model'].target_availability()).to_csv(dest/'target_availability.csv',index=False,encoding='utf-8-sig')
             end = cutoff+pd.offsets.MonthBegin(1)
             from .importance import write_regressor_importance
             importance_dir=dest/'feature_importance'/f'{cutoff:%Y-%m-%d}'
@@ -568,44 +649,52 @@ def _run(cfg,interpretation=None):
                 if not ((c['frame'].index>=cutoff)&(c['frame'].index<end)).any():
                     progress.say(f'{u}: в {cutoff:%Y-%m} нет наблюдений; прогноз пропущен',status='no_month_observations')
                     continue
-                cached=dest/'scored'/f'{cutoff:%Y-%m-%d}'/(u+'.joblib')
+                cached=dest/'scored'/f'{cutoff:%Y-%m-%d}'/(u+('' if train_classifiers else '.detector')+'.joblib')
                 with progress.stage(tag+f' · {u} · оценки месяца и признаки'):
                     score_token=score_fingerprint(c,end,state_token)
                     saved=joblib.load(cached) if cached.exists() else None
                     if saved and saved.get('fingerprint')==score_token:
                         month=saved['month']
+                        if 'model_token' not in saved:
+                            saved.update(model_token=state_token,report_config=semantic_config(cfg))
+                            atomic_dump(saved,cached)
                         progress.say('Восстановлены сохранённые оценки месяца: '+str(cached))
                     else:
-                        month=score_month(state,c,spec,cfg,cutoff,end)
-                        atomic_dump(dict(fingerprint=score_token,month=month),cached)
+                        month=score_month(state,c,spec,cfg,cutoff,end,with_features=train_classifiers)
+                        atomic_dump(dict(fingerprint=score_token,model_token=state_token,
+                                         report_config=semantic_config(cfg),month=month),cached)
                 prediction_diagnostics[u].extend(month['diagnostics'])
                 for view,scores in month['views'].items():
                     pieces[u].setdefault(view, []).append(scores)
                 for view,scores in month.get('frozen_views',{}).items():
                     frozen_pieces[u].setdefault(view,[]).append(scores)
-                error_parts[u].append(month['errors']);feature_parts[u].append(month['features'])
+                error_parts[u].append(month['errors'])
+                if 'predictions' in month:prediction_parts[u].append(month['predictions'])
+                if month['features'] is not None:feature_parts[u].append(month['features'])
             write_update_reports(dest,audit_rows)
             progress.say(tag+' · расчёт месяца завершён',status='month_complete')
             from .monthly_risk import month_features
-            features=month_features(pieces,feature_parts,selected,spec,beginning,end,cfg,dest)
+            features=month_features(pieces,feature_parts,selected,spec,beginning,end,cfg,dest) if train_classifiers else {}
             yield dict(kind='month',name=name,spec=spec,items=items,cutoff=cutoff,end=end,
                 next_cutoff=following,features=features,pieces=pieces,selected=selected,number=month_number)
         write_update_reports(dest,audit_rows)
         if state is None:
             if report:report.safely('finish',name,spec,progress,available=False)
-            statuses.append(dict(experiment=name, status='insufficient_history')); return
+            write_status(experiment=name,status='insufficient_history'); return
         from .interpretation import write_catalog
         for u in spec['recipients']:
             ud = dest/u; ud.mkdir(exist_ok=True)
             full_index=selected[u]['frame'].index
             full_index=full_index[(full_index>=beginning)&(full_index<months[-1]+pd.offsets.MonthBegin(1))]
             if not len(full_index):
-                statuses.append(dict(experiment=name,unit=u,status='no_recipient_observations_in_period'));continue
-            if not feature_parts[u]:
-                statuses.append(dict(experiment=name,unit=u,status='no_scored_recipient_history',model=str(ud/'model')));continue
-            timeline_features = pd.concat(feature_parts[u]).sort_index().reindex(full_index)
+                write_status(experiment=name,unit=u,status='no_recipient_observations_in_period');continue
+            if not error_parts[u]:
+                write_status(experiment=name,unit=u,status='no_scored_recipient_history',model=str(ud/'model'));continue
+            timeline_features = pd.concat(feature_parts[u]).sort_index().reindex(full_index) if train_classifiers else None
             residuals = pd.concat(error_parts[u]).sort_index().reindex(full_index)
             residuals.to_parquet(ud/'prequential_errors.parquet')
+            if prediction_parts[u]:
+                pd.concat(prediction_parts[u]).sort_index().reindex(full_index).to_parquet(ud/'prequential_predictions.parquet')
             pd.DataFrame(prediction_diagnostics[u]).to_csv(ud/'prediction_diagnostics.csv',index=False,encoding='utf-8-sig')
             with progress.stage(name+f' · {u} · тревоги, метрики и отчёты'):
                 timelines = {}
@@ -629,10 +718,11 @@ def _run(cfg,interpretation=None):
                         events.to_csv(ud/(slug+'_events.csv'), index=False, encoding='utf-8-sig')
                         if b == cfg['alarm_budget']:
                             timelines[view] = scored
-                from .risk_dataset import alarm_features
-                timeline_features=alarm_features(timeline_features,timelines['mean::instant'],cfg)
-                timeline_features.to_parquet(ud/'interpretation_features.parquet')
-                write_catalog(timelines, timeline_features, selected[u], cfg, ud)
+                if train_classifiers:
+                    from .risk_dataset import alarm_features
+                    timeline_features=alarm_features(timeline_features,timelines['mean::instant'],cfg)
+                    timeline_features.to_parquet(ud/'interpretation_features.parquet')
+                    write_catalog(timelines, timeline_features, selected[u], cfg, ud)
                 frozen_folder=ud/'frozen';frozen_folder.mkdir(exist_ok=True)
                 for view,parts in frozen_pieces[u].items():
                     data=pd.concat(parts).sort_index().reindex(full_index)
@@ -650,11 +740,23 @@ def _run(cfg,interpretation=None):
                         slug=view.replace(':','_')+'__'+str(budget)
                         scored.to_parquet(frozen_folder/(slug+'.parquet'))
                         episodes.to_csv(frozen_folder/(slug+'_alarms.csv'),index=False,encoding='utf-8-sig')
-            statuses.append(dict(experiment=name, unit=u, status='complete', model=str(ud/'model')))
+            write_status(experiment=name,unit=u,status='complete',model=str(ud/'model'))
         pd.DataFrame(summaries).to_csv(root/'comparison.csv', index=False, encoding='utf-8-sig')
         pd.DataFrame(frozen_summaries).to_csv(root/'comparison_frozen.csv',index=False,encoding='utf-8-sig')
         pd.DataFrame(period_summaries).to_csv(root/'comparison_periods.csv',index=False,encoding='utf-8-sig')
         if report:report.safely('finish',name,spec,progress)
+    def guarded_experiment(number,spec):
+        name=experiment_name(spec)
+        write_status(experiment=name,status='running',reason='')
+        try:
+            yield from _experiment(number,spec)
+        except Exception as exc:
+            error=type(exc).__name__+': '+str(exc)
+            dest=root/'experiments'/name;dest.mkdir(parents=True,exist_ok=True)
+            (dest/'error.txt').write_text(traceback.format_exc(),encoding='utf-8')
+            write_status(experiment=name,status='failed',reason=error)
+            progress.say('Ошибка эксперимента '+name+': '+error+'. Остальные эксперименты продолжаются.',status='experiment_failed')
+            if report:report.safely('finish',name,spec,progress,available=False)
     # Advance every detector of a family to the same month before updating risk.
     # Generators keep per-experiment state and the existing durable exports.
     from .monthly_risk import MonthlyRisk,family_key,interpretation_options
@@ -664,20 +766,23 @@ def _run(cfg,interpretation=None):
     for members in families.values():
         active=[];all_items=[]
         for number,spec in members:
-            generator=_experiment(number,spec)
+            generator=guarded_experiment(number,spec)
             initial=next(generator,None)
             if initial is None:continue
             active.append([generator,initial]);all_items.extend(initial['items'])
         if not active:continue
         groups=[all_items] if cfg['risk_policy']['scope']=='group' else [[item] for item in all_items]
-        sessions=[MonthlyRisk(cfg,group,contexts,risk_options) for group in groups]
+        sessions=[MonthlyRisk(cfg,group,contexts,risk_options) for group in groups] if train_classifiers else []
         snapshots={}
         while active:
             cutoff=min(row[1]['next_cutoff'] for row in active)
             batch=[]
             for row in active:
                 if row[1]['next_cutoff']!=cutoff:continue
-                step=next(row[0]);row[1]=step;batch.append(step)
+                step=next(row[0],None)
+                if step is None:
+                    row[1]={**row[1],'next_cutoff':None};continue
+                row[1]=step;batch.append(step)
                 for item in step['items']:
                     f=step['features'].get(item['unit'])
                     if f is not None:snapshots[(item['experiment'],item['unit'])]=f
@@ -692,7 +797,7 @@ def _run(cfg,interpretation=None):
                     risk_rows.extend(dict(experiment=item['experiment'],unit=item['unit'],head=head,**status)
                                      for head,status in risk_status.items())
                     if report:report.safely('set_monthly_risk',item,risk_status,risk_timeline.get(item['unit']))
-            pd.DataFrame(risk_rows).to_csv(root/'risk_status.csv',index=False,encoding='utf-8-sig')
+            if train_classifiers:pd.DataFrame(risk_rows).to_csv(root/'risk_status.csv',index=False,encoding='utf-8-sig')
             ready=[]
             from .risk_reporting import readiness_rows
             by_item={}
@@ -717,7 +822,9 @@ def _run(cfg,interpretation=None):
     progress.view=general_view
     with progress.stage('итоговое сравнение на общих часах'):
         common_comparison(root,contexts,cfg)
-    progress.say('Расчёт завершён. Список готовых моделей: '+str((root/'models.csv').resolve()),status='complete')
+    failed=sum(r['status']=='failed' for r in statuses)
+    progress.say(('Расчёт завершён с ошибками в '+str(failed)+' строках status.csv. ' if failed else 'Расчёт завершён. ')+
+                 'Список готовых моделей: '+str((root/'models.csv').resolve()),status='complete_with_errors' if failed else 'complete')
     return dict(summary=pd.DataFrame(summaries), status=pd.DataFrame(statuses), interpretation=pd.DataFrame(risk_rows))
 
 

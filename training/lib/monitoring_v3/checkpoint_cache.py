@@ -19,8 +19,13 @@ LIBRARIES=('numpy','pandas','scipy','scikit-learn','catboost','joblib')
 def semantic_config(cfg):
     result={**DEFAULTS,**cfg}
     # Selection and destination do not change one concrete experiment's model.
-    return {k:v for k,v in result.items() if k not in
+    result = {k:v for k,v in result.items() if k not in
             ('output','models','feature_sets','horizons','scenarios','groups','data_root','data_paths','sensor_file','sensor_rules')}
+    # Related links are frozen inside each fitted model. Preserve existing
+    # conditions checkpoints when the default automatic selector is introduced.
+    if result.get('related_policy')==DEFAULTS['related_policy']:
+        result.pop('related_policy',None)
+    return result
 
 
 def _data_chunks(contexts,cutoff,cfg,spec):
@@ -41,8 +46,10 @@ def signatures(contexts,cutoff,cfg,spec):
     implementation=hashlib.sha256(json.dumps(dict(cfg=cfg,spec=spec),sort_keys=True,ensure_ascii=False).encode())
     for source in sorted(Path(__file__).parent.glob('*.py')):implementation.update(source.read_bytes())
     implementation.update((Path(__file__).parent.parent/'kernel_models.py').read_bytes())
-    state=hashlib.sha256(json.dumps(dict(contract=STATE_CONTRACT,cfg=semantic_config(cfg),spec=spec),
-                                 sort_keys=True,ensure_ascii=False).encode())
+    state_description=dict(contract=STATE_CONTRACT,cfg=semantic_config(cfg),spec=spec)
+    if spec['variant']=='related' and spec['method'] in ('AAKR','MSET'):
+        state_description['kernel_related_contract']='classical_all_pinv_complete_v2'
+    state=hashlib.sha256(json.dumps(state_description,sort_keys=True,ensure_ascii=False).encode())
     for chunk in _data_chunks(contexts,cutoff,cfg,spec):
         implementation.update(chunk);state.update(chunk)
     return implementation.hexdigest(),state.hexdigest()

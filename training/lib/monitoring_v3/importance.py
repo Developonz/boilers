@@ -34,7 +34,8 @@ def regressor_importance(model):
     elif hasattr(model,'correction'):
         parts=[regressor_importance(model.correction)]
     elif hasattr(model,'shared'):
-        parts=[_safe_native(model.shared,'__shared_targets__',threads)]
+        parts=[_safe_native(model.shared,'__shared_targets__',threads)] if model.shared is not None else []
+        parts.extend(regressor_importance(m) for m in getattr(model,'late_models',{}).values())
     elif hasattr(model,'predictors'):
         for target in model.targets:
             item=model.predictors.get(target)

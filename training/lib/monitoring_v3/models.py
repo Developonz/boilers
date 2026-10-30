@@ -112,6 +112,9 @@ class NormalModel:
         self.method, self.cfg = method, deepcopy(cfg)
         self.updates = 0
 
+    def _numeric_features(self,features):
+        return self.encoder.numeric(features)
+
     def fit_initial(self, features, targets):
         self.encoder = FrozenEncoder.fit(features)
         self.targets = list(targets)
@@ -134,18 +137,29 @@ class NormalModel:
             self.predictors = {}
             self._fit_trees(features, targets, initial=True)
         else:
-            c, y = self.encoder.numeric(features), targets.to_numpy(float)
+            c, y = self._numeric_features(features), targets.to_numpy(float)
             if self.method == 'analogs':
                 self.stats = LinearStats(c.shape[1]+1, y.shape[1])
                 self.stats.update(np.column_stack([np.ones(len(c)), c]), y)
             else:
                 import kernel_models as KM
                 klass = KM.AAKR if self.method == 'AAKR' else KM.MSET
-                self.kernel = klass(memory=self.cfg['memory_rows'], neighbors=min(10, max(0, y.shape[1]-1)), seed=self.cfg['seed'])
-                self.kernel.fit(y, c, np.empty((len(c), 0)))
-                lin_f = self.kernel.lin._F(c, np.empty((len(c), 0)))
-                self.stats = LinearStats(lin_f.shape[1], y.shape[1])
-                self.kernel.lin.beta = self.stats.update(lin_f, y)
+                sensor_mode=getattr(self,'sensor_input_mode',None)
+                all_other=sensor_mode=='all_other'
+                classic=sensor_mode=='all'
+                p=y.shape[1]
+                nb=np.array([[i for i in range(p) if i!=j] for j in range(p)],dtype=np.int32).reshape(p,max(0,p-1)) if all_other else None
+                self.kernel = klass(memory=self.cfg['memory_rows'], neighbors=max(0,p-1) if all_other else min(10,max(0,p-1)),
+                    mode=sensor_mode if (all_other or classic) else 'per_sensor',robust=not (all_other or classic),
+                    linear=not classic,seed=self.cfg['seed'])
+                if classic and self.method=='MSET':
+                    self.kernel.full_memory=True;self.kernel.lam=0.
+                self.kernel.fit(y, c, np.empty((len(c), 0)),nb=nb)
+                if self.kernel.lin is not None:
+                    lin_f = self.kernel.lin._F(c, np.empty((len(c), 0)))
+                    self.stats = LinearStats(lin_f.shape[1], y.shape[1])
+                    self.kernel.lin.beta = self.stats.update(lin_f, y)
+                else:self.stats=None
             self._rebuild_memory()
         return self
 
@@ -239,14 +253,14 @@ class NormalModel:
                 combined_y = pd.concat([self.memory_y.iloc[keep], targets]).reindex(combined_f.index)
             self._fit_trees(combined_f, combined_y, initial=False)
         else:
-            c = self.encoder.numeric(features)
+            c = self._numeric_features(features)
             if self.method == 'analogs':
                 f = np.column_stack([np.ones(len(c)), c])
-            else:
+            elif self.kernel.lin is not None:
                 f = self.kernel.lin._F(c, np.empty((len(c), 0)))
-            beta = self.stats.update(f, targets.to_numpy(float))
-            if self.method != 'analogs':
-                self.kernel.lin.beta = beta
+            if self.stats is not None:
+                beta = self.stats.update(f, targets.to_numpy(float))
+                if self.method != 'analogs':self.kernel.lin.beta = beta
         with phase(f'обновление памяти примеров: лимит {self.cfg["memory_rows"]} строк'):
             self.counts += targets.count().to_numpy()
             self.memory_f = pd.concat([self.memory_f, features])
@@ -259,7 +273,7 @@ class NormalModel:
         return self
 
     def _rebuild_memory(self):
-        c = self.encoder.numeric(self.memory_f)
+        c = self._numeric_features(self.memory_f)
         y = self.memory_y.to_numpy(float)
         if self.method == 'analogs':
             from sklearn.neighbors import NearestNeighbors
@@ -268,9 +282,10 @@ class NormalModel:
             self.nn = NearestNeighbors(n_neighbors=min(self.cfg['neighbors'], len(c))).fit(c)
         else:
             m = self.kernel
-            residual = y-m.lin.predict(c, np.empty((len(c), 0)))
+            residual = y-(m.lin.predict(c, np.empty((len(c), 0))) if m.lin is not None else 0.)
             m.Mx = ((residual-m.xm)/m.xs).astype(np.float32)
             m.Mc = m._cond(c, np.empty((len(c), 0))).astype(np.float32)
+            m.__dict__.pop('_full_factor_cache',None)
 
     def _tree_prediction_input(self, features):
         """One transient input per batch; never retain a native Pool in model state."""
@@ -319,7 +334,7 @@ class NormalModel:
                 med[:, j], spread[:, j] = pred[:, 1], np.maximum((pred[:, 2]-pred[:, 0])/1.349, self.floor[j])
                 reporter.done()
         else:
-            c = self.encoder.numeric(features)
+            c = self._numeric_features(features)
             if self.method == 'analogs':
                 for start in range(0, n, 128):
                     pos = slice(start, min(n, start+128))
@@ -329,7 +344,11 @@ class NormalModel:
                     med[pos] = q[1]+np.column_stack([np.ones(len(c[pos])), c[pos]])@self.stats.beta
                     spread[pos] = np.maximum((q[2]-q[0])/1.349, self.floor)
             else:
-                med, spread = self.kernel.predict(actual.reindex(columns=self.targets).to_numpy(float), c, np.empty((n, 0)))
+                # Bound tensors by memory width for a 200--400 sensor related
+                # model; MSET additionally bounds its local Gram blocks.
+                chunk=(max(1,min(32,2_000_000//max(1,len(self.kernel.Mx)*len(self.targets))))
+                       if getattr(self,'sensor_input_mode',None) in ('all_other','all') else 32)
+                med, spread = self.kernel.predict(actual.reindex(columns=self.targets).to_numpy(float), c, np.empty((n, 0)),chunk=chunk)
                 spread = np.maximum(spread, self.floor)
         valid = self.counts >= self.cfg['min_sensor_rows']
         med[:, ~valid], spread[:, ~valid] = np.nan, np.nan
@@ -421,22 +440,104 @@ class NormalModel:
                                                     trees=candidate.tree_counts())
 
 
+class RelatedKernelModel(NormalModel):
+    """Classical autoassociative reconstruction with one complete sensor vector."""
+    sensor_input_mode='all'
+
+    def _numeric_features(self,features):
+        # Fixed scaling/one-hot encoding, without median imputation or missing
+        # indicator columns. Complete-vector checks run before this method.
+        parts=[]
+        for c in self.encoder.columns:
+            if c in self.encoder.categories:
+                values=features[c].astype('string')
+                categories=self.encoder.categories[c]
+                parts.extend(values.eq(v).to_numpy(float) for v in categories)
+                parts.append((~values.isin(categories)).to_numpy(float))
+            else:
+                parts.append(((features[c]-self.encoder.medians[c])/self.encoder.scales[c]).to_numpy(float))
+        return np.column_stack(parts) if parts else np.empty((len(features),0))
+
+    @staticmethod
+    def _conditions(features):
+        return features.loc[:,[c for c in features if not c.startswith('sensor::')]]
+
+    @classmethod
+    def complete_vectors(cls,features,targets):
+        f=cls._conditions(features)
+        numeric=f.select_dtypes(include='number')
+        return (f.notna().all(axis=1)&np.isfinite(numeric).all(axis=1)&np.isfinite(targets).all(axis=1))
+
+    def fit_initial(self,features,targets):
+        complete=self.complete_vectors(features,targets)
+        if complete.sum()<self.cfg['min_sensor_rows']:
+            raise ValueError(f'Classical {self.method}: {int(complete.sum())} complete training vectors; '
+                             f"required {self.cfg['min_sensor_rows']}")
+        self.vector_diagnostics=dict(input_rows=len(targets),complete_rows=int(complete.sum()),
+                                     incomplete_rows=int((~complete).sum()))
+        super().fit_initial(self._conditions(features.loc[complete]),targets.loc[complete])
+        self.related_diagnostics=[dict(target=c,input='все проверяемые датчики, включая сам датчик',
+            input_count=len(self.targets),includes_self=True,source='classical_all',
+            estimator='full_memory_MSET' if self.method=='MSET' else 'AAKR') for c in self.targets]
+        return self
+
+    def update(self,features,targets):
+        complete=self.complete_vectors(features,targets)
+        self.vector_diagnostics=dict(input_rows=len(targets),complete_rows=int(complete.sum()),
+                                     incomplete_rows=int((~complete).sum()))
+        if not complete.any():return self
+        return super().update(self._conditions(features.loc[complete]),targets.loc[complete])
+
+    def expected(self,features,actual,**kwargs):
+        complete=self.complete_vectors(features,actual.reindex(columns=self.targets))
+        median=pd.DataFrame(np.nan,index=features.index,columns=self.targets);spread=median.copy()
+        if complete.any():
+            m,s=super().expected(self._conditions(features.loc[complete]),actual.loc[complete],**kwargs)
+            median.loc[complete]=m;spread.loc[complete]=s
+        return median,spread
+
+
 class RelatedModel:
-    """Independent predictors with explicit, reviewed sibling inputs, never self inputs."""
+    """Frozen sibling inputs, selected on training data; explicit lists take priority."""
     def __init__(self, cfg, related):
-        self.cfg, self.related = cfg, related
+        self.cfg, self.related = deepcopy(cfg), deepcopy(related)
         self.method = 'CatBoost-related'
         self.updates = 0
 
     def _inputs(self, f, target):
         keep = [c for c in f if not c.startswith('sensor::')]
         siblings = self.related.get(target, [])
-        if target in siblings or not siblings:
-            raise ValueError(f'Related inputs for {target} must be nonempty and exclude the target')
+        if target in siblings:
+            raise ValueError(f'Related inputs for {target} must exclude the target')
         return f[keep+['sensor::'+c for c in siblings]]
 
     def fit_initial(self, features, targets):
         self.targets = list(targets)
+        from .config import DEFAULTS
+        policy={**DEFAULTS['related_policy'],**self.cfg.get('related_policy',{})}
+        available={c.removeprefix('sensor::') for c in features if c.startswith('sensor::')}
+        rows=np.linspace(0,len(features)-1,min(len(features),policy['sample_rows'])).astype(int)
+        sample=targets.iloc[rows].replace([np.inf,-np.inf],np.nan)
+        correlations=sample.corr(method='spearman',min_periods=self.cfg['min_sensor_rows']) if policy['mode']=='auto' else None
+        self.related_diagnostics=[]
+        for target in self.targets:
+            if target in self.related:
+                chosen=list(dict.fromkeys(self.related[target]));source='manual'
+                if target in chosen or set(chosen)-available:
+                    raise ValueError(f'Invalid related inputs for {target}: self input or unavailable sensor')
+            elif policy['mode']=='manual':
+                raise ValueError(f'No related_inputs for {target}; provide a list or use related_policy.mode="auto"')
+            else:
+                candidates=correlations[target].drop(labels=[target]).dropna()
+                candidates=candidates.loc[candidates.index.isin(available)&candidates.abs().ge(policy['min_abs_correlation'])]
+                chosen=sorted(candidates.index,key=lambda c:(-abs(candidates[c]),c))[:policy['max_inputs']]
+                source='training_spearman' if chosen else 'conditions_fallback'
+            self.related[target]=chosen
+            if not chosen:
+                self.related_diagnostics.append(dict(target=target,input='',source=source,correlation=np.nan))
+            for sibling in chosen:
+                self.related_diagnostics.append(dict(target=target,input=sibling,source=source,
+                    correlation=float(correlations.loc[target,sibling]) if correlations is not None and sibling in correlations else np.nan))
         self.members = {c: NormalModel('CatBoost', self.cfg).fit_initial(self._inputs(features, c), targets[[c]]) for c in targets}
         self.scale = np.array([self.members[c].scale[0] for c in targets])
         self.memory_f = features.iloc[balanced_rows(features, self.cfg['memory_rows'])].copy()
@@ -533,15 +634,21 @@ class AnalogCorrection:
 class MultiTargetModel(NormalModel):
     """Shared trees; observed target coordinates only, frozen output scaling."""
     def fit_initial(self, features, targets):
+        targets=targets.replace([np.inf,-np.inf],np.nan)
         self.targets=list(targets);self.encoder=FrozenEncoder.fit(features)
         self.counts=targets.count().to_numpy(copy=True)
-        self.centers=targets.median().to_numpy(float)
+        self.centers=targets.median().fillna(0).to_numpy(float)
         self.scale=targets.std().fillna(0).clip(lower=1e-3).to_numpy(float)
         self.floor=self.scale*.1
         rules=json.loads(Path(self.cfg['sensor_rules']).read_text(encoding='utf-8')) if Path(self.cfg['sensor_rules']).exists() else {}
         policies=[{**rules.get('defaults',{}),**rules.get('sensors',{}).get(c,{})} for c in self.targets]
         self.floor=np.maximum(self.floor,[max(float(p.get('scale_floor',0)),float(p.get('resolution',0))) for p in policies])
         self.engineering_floor=self.floor.copy()
+        # CatBoost cannot initialise a multivariate bias for a completely empty
+        # coordinate. Keep the public schema, but fit only observed outputs.
+        self.shared_targets=[c for c in targets if targets[c].count()>=self.cfg['min_sensor_rows']]
+        self.late_models={}
+        self.shared=None
         self._fit_shared(features,targets,None)
         rows=balanced_rows(features,self.cfg['memory_rows'])
         self.memory_f,self.memory_y=features.iloc[rows],targets.iloc[rows]
@@ -549,6 +656,12 @@ class MultiTargetModel(NormalModel):
 
     def _fit_shared(self, f, y, old):
         from catboost import CatBoostRegressor
+        columns=getattr(self,'shared_targets',self.targets)  # old checkpoints
+        if not columns:return
+        y=y[columns].replace([np.inf,-np.inf],np.nan)
+        observed=y.notna().any(axis=1)
+        if not observed.any():
+            self.shared=old;return
         n=self.cfg['cb_initial_trees'] if old is None else self.cfg['cb_update_trees']
         if old is not None and old.tree_count_+n > self.cfg['cb_max_trees']:
             self.shared=old;return
@@ -556,16 +669,30 @@ class MultiTargetModel(NormalModel):
             depth=self.cfg['cb_depth'],learning_rate=self.cfg['learning_rate'],has_time=True,
             random_seed=self.cfg['seed'],thread_count=self.cfg['threads'],allow_writing_files=False,verbose=False,
             allow_const_label=True,boost_from_average=False if old is not None else None)
-        observed=y.notna().any(axis=1)
         from .continuation import fit_continued
-        fit_continued(self.shared,self.encoder.native(f.loc[observed]),y.loc[observed]/self.scale,old,
+        scales=pd.Series(self.scale,index=self.targets).loc[columns]
+        fit_continued(self.shared,self.encoder.native(f.loc[observed]),y.loc[observed].div(scales),old,
                         cat_features=list(self.encoder.categories))
 
     def update(self, features, targets):
+        if list(targets)!=self.targets or list(features)!=self.encoder.columns:
+            raise ValueError('Schema changed: incremental update cannot reinterpret old features')
+        targets=targets.replace([np.inf,-np.inf],np.nan)
+        if not hasattr(self,'late_models'):self.late_models={}
         rows=balanced_rows(self.memory_f,self.cfg['replay_rows'])
         f=pd.concat([self.memory_f.iloc[rows],features]).sort_index()
         y=pd.concat([self.memory_y.iloc[rows],targets]).reindex(f.index)
         self._fit_shared(f,y,self.shared)
+        for c,model in self.late_models.items():model.update(features,targets[[c]])
+        # A formerly absent sensor gets its first model and a physical scale
+        # from real past observations, without rebuilding the shared ensemble.
+        for c in self.targets:
+            if c in getattr(self,'shared_targets',self.targets) or c in self.late_models:continue
+            if y[c].count()<self.cfg['min_sensor_rows']:continue
+            model=NormalModel('CatBoost',self.cfg).fit_initial(f,y[[c]])
+            self.late_models[c]=model;j=self.targets.index(c)
+            self.centers[j]=model.centers[0];self.scale[j]=model.scale[0]
+            self.floor[j]=model.floor[0];self.engineering_floor[j]=model.engineering_floor[0]
         self.counts+=targets.count().to_numpy()
         f=pd.concat([self.memory_f,features]);y=pd.concat([self.memory_y,targets])
         rows=balanced_rows(f,self.cfg['memory_rows'])
@@ -574,10 +701,28 @@ class MultiTargetModel(NormalModel):
         return self
 
     def expected(self, features, actual):
-        med=np.asarray(self.shared.predict(self.encoder.native(features),thread_count=self.cfg['threads'])).reshape(len(features),len(self.targets))*self.scale
-        med[:,self.counts < self.cfg['min_sensor_rows']]=np.nan
-        return pd.DataFrame(med,index=features.index,columns=self.targets),pd.DataFrame(
-            np.broadcast_to(np.maximum(self.scale,self.floor),med.shape),index=features.index,columns=self.targets)
+        med=pd.DataFrame(np.nan,index=features.index,columns=self.targets)
+        spread=med.copy()
+        columns=getattr(self,'shared_targets',self.targets)
+        if len(features) and self.shared is not None:
+            scale=pd.Series(self.scale,index=self.targets).loc[columns]
+            med[columns]=np.asarray(self.shared.predict(self.encoder.native(features),thread_count=self.cfg['threads'])).reshape(len(features),len(columns))*scale.to_numpy()
+            spread[columns]=np.broadcast_to(pd.Series(np.maximum(self.scale,self.floor),index=self.targets).loc[columns],(len(features),len(columns)))
+        for c,model in getattr(self,'late_models',{}).items():
+            m,s=model.expected(features,actual[[c]])
+            med[c]=m[c];spread[c]=np.maximum(s[c],self.floor[self.targets.index(c)])
+        med.loc[:,self.counts < self.cfg['min_sensor_rows']]=np.nan
+        return med,spread
 
     def tree_counts(self):
-        return {'shared':self.shared.tree_count_}
+        counts={'shared':self.shared.tree_count_} if self.shared is not None else {}
+        for c,model in getattr(self,'late_models',{}).items():counts.update(model.tree_counts())
+        for c in self.targets:
+            if c not in getattr(self,'shared_targets',self.targets) and c not in getattr(self,'late_models',{}):counts[c]=0
+        return counts
+
+    def target_availability(self):
+        shared=getattr(self,'shared_targets',self.targets)
+        return [dict(sensor=c,observed_rows=int(self.counts[j]),status=(
+            'shared' if c in shared else 'individual_late' if c in getattr(self,'late_models',{}) else 'waiting_for_measurements'))
+            for j,c in enumerate(self.targets)]

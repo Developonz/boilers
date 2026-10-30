@@ -1,5 +1,6 @@
 """Source audit and event registry. Repair labels never enter predictor features."""
 from pathlib import Path
+from copy import deepcopy
 import json
 import numpy as np
 import pandas as pd
@@ -67,6 +68,7 @@ def prepare_unit(frame, roles, unit, cfg, rules, threshold=None, regime_spec=Non
     input_columns=[c for c,r in roles.items() if r in ('load','condition','state')]
     input_coverage=cleaned[input_columns].notna().mean(axis=1)
     return dict(frame=frame, cleaned=cleaned, roles=roles, unit=unit, targets=targets,
+                preparation_rules=deepcopy(rules),preparation_config={k:deepcopy(cfg[k]) for k in ('step','startup_hours','load_hold_hours','regime_policy')},
                 threshold=float(threshold), threshold_source=source, load=load, regime=mode,
                 features=features, quality=flags,input_quality=all_flags,changes=changes,events=events,eligible=eligible,
                 regime_spec=regime_spec,regime_policy=cfg['regime_policy'],input_coverage=input_coverage,preparation_reference_end=pd.Timestamp(regime_spec['reference_end']))

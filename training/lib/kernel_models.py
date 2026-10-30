@@ -2,6 +2,8 @@
 Модели AAKR и MSET: ожидание каждого датчика по похожим часам нормальной работы. Два режима: mode='per_sensor' (по
 умолчанию) — у каждого датчика свои входы: условия работы, состояния механизмов и связанные датчики, без него самого;
 mode='all' — классический: одно расстояние по всем датчикам сразу, сам датчик тоже входит (ноутбук 02 — «… (все датчики)»).
+В monitoring_v3 related используется mode='all', linear=False, robust=False; у MSET full_memory=True,
+lam=0 включает псевдообратную матрицу по всей сохранённой памяти. Для этого пути также нужен scipy.
 Используются ноутбуком 02 (раздел 4.7, класс KernelDet) и экспортом k2_deploy (ядро «kernel»: код инференса копируется
 в model.py папки модели, поэтому папка модели от этого файла не зависит). Нужны только numpy и pandas.
 
@@ -152,7 +154,7 @@ class AAKR:
         self.xm, self.xs = robust_scale(X)
         self.cm, self.cs = robust_scale(C)
         Xn = (X - self.xm) / self.xs
-        self.nb = nb if nb is not None else find_neighbors(Xn, self.k, seed=self.seed)
+        self.nb = nb if nb is not None else (np.empty((X.shape[1],0),dtype=np.int32) if self.mode=='all' else find_neighbors(Xn,self.k,seed=self.seed))
         rng = np.random.default_rng(self.seed)
         rows = self._memory_rows(Xn, C, B, rng)
         self.Mc = self._cond(C[rows], B[rows]).astype(np.float32)
@@ -183,6 +185,8 @@ class AAKR:
             sl = slice(a, min(a + chunk, n))
             xq, aq = Xn[sl], A[sl]
             dc = ((aq[:, None, :] - self.Mc[None]) ** 2).sum(-1)                      # условия: строки × память
+            if getattr(self,'full_memory',False):
+                dc=((aq.astype(float)[:,None,:]-self.Mc.astype(float)[None])**2).sum(-1)
             T = (xq[:, None, :] - self.Mx[None]) ** 2                                   # строки × память × датчики
             V = ~np.isnan(T)
             T = np.nan_to_num(T, copy=False)
@@ -229,6 +233,7 @@ class AAKR:
     def __getstate__(self):
         d = self.__dict__.copy()
         d.pop('_A', None)
+        d.pop('_full_factor_cache',None)
         return d
 
     def _estimate(self, xq, dc, T, V, q, cols, h, flagged):
@@ -242,6 +247,16 @@ class AAKR:
             w = self._weights(dc, (T * Vf).sum(-1), Vf.sum(-1), q, h)                  # строки × память
             num, den = w @ Mt0, w @ ok.astype(np.float32)
             Eb[:, cols] = np.where(den > 0, num / np.where(den > 0, den, 1), np.nan)
+            return Eb
+        if self.mode == 'all_other':
+            # Sum once and subtract the target's own coordinate instead of
+            # multiplying by a dense off-diagonal adjacency matrix.
+            Vf=V if flagged is None else V & ~flagged[:,None,:]
+            weighted=T*Vf
+            ds=weighted.sum(-1,keepdims=True,dtype=np.float64)-weighted[:,:,cols]
+            cnt=Vf.sum(-1,keepdims=True)-Vf[:,:,cols].astype(np.int32)
+            d2=(dc[:,:,None]+ds)/np.maximum(q+cnt,1)
+            Eb[:,cols]=self._combine(d2,Mt0,ok,h,xq,cols,flagged)
             return Eb
         A = self._adj()[:, cols]                                                       # датчики × оцениваемые
         if flagged is None:
@@ -282,6 +297,8 @@ class MSET(AAKR):
         тоже входит) и веса с учётом их сходства между собой; иначе — по датчикам (как AAKR, см. _local)."""
         if self.mode != 'all':
             return super()._estimate(xq, dc, T, V, q, cols, h, flagged)
+        if getattr(self,'full_memory',False):
+            return self._full_estimate(xq,dc,T,V,q,cols,h,flagged)
         with np.errstate(invalid='ignore', over='ignore', divide='ignore'):
             nrow, M, p = T.shape
             Vf = V if flagged is None else V & ~flagged[:, None, :]
@@ -310,6 +327,31 @@ class MSET(AAKR):
             Eb[:, cols] = np.where(np.abs(den) > 1e-12, num / np.where(np.abs(den) > 1e-12, den, 1.0), np.nan)
             return Eb
 
+    def _full_estimate(self,xq,dc,T,V,q,cols,h,flagged):
+        """Classical MSET: D @ pinv(D.T ⊗ D) @ (D.T ⊗ x), no ridge or imputation."""
+        from scipy.linalg import pinvh
+        if self.lam!=0 or flagged is not None:raise ValueError('Classical MSET requires lam=0 and robust=False')
+        if not (np.isfinite(self.Mx).all() and np.isfinite(self.Mc).all() and np.isfinite(xq).all()):
+            raise ValueError('Classical MSET requires complete dictionary and query vectors')
+        token=float(h)
+        cache=self.__dict__.get('_full_factor_cache')
+        if cache is None or cache[0]!=token:
+            z=np.hstack([self.Mc,self.Mx]).astype(float)
+            squares=(z*z).sum(-1)
+            distance=np.maximum(squares[:,None]+squares[None,:]-2*(z@z.T),0.)/z.shape[1]
+            gram=np.exp(-distance/(h*h))
+            inverse,rank=pinvh(gram,rtol=1e-10,return_rank=True,check_finite=True)
+            self.dictionary_rank=int(rank)
+            self._full_factor_cache=(token,inverse)
+        inverse=self._full_factor_cache[1]
+        ds=((xq.astype(float)[:,None,:]-self.Mx.astype(float)[None])**2).sum(-1)
+        rhs=np.exp(-(dc+ds)/(q+self.p)/(h*h))
+        weights=rhs@inverse
+        if not np.isfinite(weights).all():raise ValueError('Nonfinite full-memory MSET weights')
+        out=np.full((len(xq),self.p),np.nan,dtype=np.float32)
+        out[:,cols]=weights@self.Mx[:,cols]
+        return out
+
     def _memory_rows(self, Xn, C, B, rng):
         base = super()._memory_rows(Xn, C, B, rng)
         ext = []
@@ -328,6 +370,9 @@ class MSET(AAKR):
     def _local(self, d2, Mt0, ok, h, xq, cols, flagged, block=48):
         nrow, M, nc = d2.shape
         K = min(self.local, M)
+        # All-other inputs can be hundreds of channels. Avoid allocating a
+        # rows x K x K x 48 x channels tensor (several GB on real boilers).
+        block=min(block,max(1,2_000_000//max(1,nrow*K*K*self.nb.shape[1])))
         cols = np.asarray(cols)
         d2 = np.where(ok.T[None], d2.transpose(0, 2, 1), np.inf)    # строки × датчики × память; нет значения — не брать
         kk = np.argpartition(d2, K - 1, axis=2)[:, :, :K]
